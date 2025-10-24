@@ -88,7 +88,7 @@ function Space.tileSpace(space)
         Space.PaperWM.windows.tileColumn(column, bounds, h, anchor_frame.w, anchor_window:id(),
             anchor_frame.h)
     end
-    Space.PaperWM.windows.updateVirtualPositions(space, column, anchor_frame.x)
+    local updated = Space.PaperWM.windows.updateVirtualPositions(space, column, anchor_frame.x)
 
     local right_gap = Space.PaperWM.windows.getGap("right")
     local left_gap = Space.PaperWM.windows.getGap("left")
@@ -118,6 +118,10 @@ function Space.tileSpace(space)
         x = x - width - left_gap
         Space.PaperWM.windows.updateVirtualPositions(space, column, x)
         x2 = math.max(x2 - width - left_gap, left_margin)
+    end
+        
+    if PaperWMHUD and updated then
+        PaperWMHUD.show(true, true)
     end
 end
 

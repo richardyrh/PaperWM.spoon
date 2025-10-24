@@ -119,13 +119,18 @@ end
 ---@param space Space
 ---@param windows Window[]
 function Windows.updateVirtualPositions(space, windows, x)
-    if Windows.PaperWM.swipe_fingers == 0 then return end
+    if Windows.PaperWM.swipe_fingers == 0 then return false end
     if not Windows.PaperWM.state.x_positions[space] then
         Windows.PaperWM.state.x_positions[space] = {}
     end
+    local updated = false
     for _, window in ipairs(windows) do
-        Windows.PaperWM.state.x_positions[space][window] = x
+        if Windows.PaperWM.state.x_positions[space][window] ~= x then
+            updated = true
+            Windows.PaperWM.state.x_positions[space][window] = x
+        end
     end
+    return updated
 end
 
 ---save the is_floating list to settings
@@ -171,6 +176,7 @@ function Windows.tileColumn(windows, bounds, h, w, id, h4id)
         bounds.y = math.min(frame.y2 + bottom_gap, bounds.y2)
         last_window = window
     end
+
     -- expand last window height to bottom
     if frame.y2 ~= bounds.y2 then
         frame.y2 = bounds.y2
@@ -224,10 +230,16 @@ function Windows.addWindow(add_window)
     end
 
     -- ignore windows that have a zoom button, but are not maximizable
-    if not add_window:isMaximizable() then
-        Windows.PaperWM.logger.d("ignoring non-maximizable window")
-        return
-    end
+    -- if not add_window:isMaximizable() then
+    --     Windows.PaperWM.logger.d("ignoring non-maximizable window")
+    --     return
+    -- end
+    -- local f = add_window:frame()
+    -- if f.w < 300 and f.h < 300 then
+    --     Windows.PaperWM.logger.d("ignoring small window")
+    --     return
+    -- end
+    
 
     -- check if window is already in window list
     if Windows.PaperWM.state.index_table[add_window:id()] then return end
@@ -262,10 +274,11 @@ function Windows.addWindow(add_window)
     end
 
     -- add window
-    table.insert(Windows.PaperWM.state.window_list[space], add_column, { add_window })
+    clipped_add_column = math.min(#Windows.PaperWM.state.window_list[space] + 1, add_column)
+    table.insert(Windows.PaperWM.state.window_list[space], clipped_add_column, { add_window })
 
     -- update index table
-    Windows.updateIndexTable(space, add_column)
+    Windows.updateIndexTable(space, clipped_add_column)
 
     -- subscribe to window moved events
     local watcher = add_window:newWatcher(
@@ -308,10 +321,57 @@ function Windows.removeWindow(remove_window, skip_new_window_focus)
     Windows.PaperWM.state.ui_watchers[remove_window:id()] = nil
 
     -- clear window position
-    (Windows.PaperWM.state.x_positions[remove_index.space] or {})[remove_window] = nil
+    local xposs = Windows.PaperWM.state.x_positions
+    if xposs[remove_index.space] and xposs[remove_index.space][remove_window] then
+        xposs[remove_index.space][remove_window] = nil
+    else
+        print("well shit")
+    end
 
     -- update index table
     Windows.PaperWM.state.index_table[remove_window:id()] = nil
+    Windows.updateIndexTable(remove_index.space, remove_index.col)
+
+    -- remove if space is empty
+    if #Windows.PaperWM.state.window_list[remove_index.space] == 0 then
+        Windows.PaperWM.state.window_list[remove_index.space] = nil
+        Windows.PaperWM.state.x_positions[remove_index.space] = nil
+    end
+
+    return remove_index.space -- return space for removed window
+end
+
+function Windows.removeWindowIndex(remove_index, remove_id)
+    -- remove window
+    table.remove(Windows.PaperWM.state.window_list[remove_index.space][remove_index.col],
+        remove_index.row)
+    if #Windows.PaperWM.state.window_list[remove_index.space][remove_index.col] == 0 then
+        table.remove(Windows.PaperWM.state.window_list[remove_index.space], remove_index.col)
+    end
+
+    -- remove watcher
+    Windows.PaperWM.state.ui_watchers[remove_id]:stop()
+    Windows.PaperWM.state.ui_watchers[remove_id] = nil
+
+    -- clear window position
+    hs.printf("trying to remove id %d\n", remove_id)
+
+    local xposs = Windows.PaperWM.state.x_positions
+    if xposs[remove_index.space] and xposs[remove_index.space][remove_window] then
+        xposs[remove_index.space][remove_window] = nil
+    else
+        for i, xpos in pairs(xposs) do
+            for w, _ in pairs(xpos) do
+                if w:id() == remove_id then
+                    print("Removed")
+                    xpos[w] = nil
+                end
+            end
+        end
+    end
+
+    -- update index table
+    Windows.PaperWM.state.index_table[remove_id] = nil
     Windows.updateIndexTable(remove_index.space, remove_index.col)
 
     -- remove if space is empty
@@ -382,6 +442,10 @@ function Windows.focusWindow(direction, focused_index)
 
     -- focus new window, windowFocused event will be emited immediately
     new_focused_window:focus()
+            
+    if PaperWMHUD then
+        PaperWMHUD.show(true, true)
+    end
 
     -- try to prevent MacOS from stealing focus away to another window
     Timer.doAfter(Window.animationDuration, function()
@@ -390,6 +454,10 @@ function Windows.focusWindow(direction, focused_index)
             new_focused_window:focus()
         end
     end)
+
+    if PaperWMHUD then
+        PaperWMHUD.refresh()
+    end
 
     return new_focused_window
 end
@@ -413,6 +481,15 @@ function Windows.focusWindowAt(new_index)
             index = index + 1
         end
     end
+end
+
+---focus a window at a specified position
+---@param new_index number the index from left to right on the current screen
+function Windows.focusWindowID(id)
+    local screen = Screen.mainScreen()
+    local space = Spaces.activeSpaces()[screen:getUUID()]
+    local index = Windows.PaperWM.state.index_table[id]
+    Windows.PaperWM.state.window_list[space][index["col"]][index["row"]]:focus()
 end
 
 ---swap the focused window with a window next to it
@@ -930,7 +1007,22 @@ function Windows.moveWindow(window, frame)
     end
 
     watcher:stop()
+
+    local app = window:application()
+    if app then
+        local ax_app = hs.axuielement.applicationElement(app)
+
+        -- local was_enhanced = ax_app.AXEnhancedUserInterface
+        -- if not was_enhanced then
+        ax_app.AXEnhancedUserInterface = false
+        -- end
+    end
+
+    -- https://github.com/Hammerspoon/hammerspoon/issues/3731
+
+    -- set & run action
     window:setFrame(frame)
+
     Timer.doAfter(Window.animationDuration + padding, function()
         watcher:start({ Watcher.windowMoved, Watcher.windowResized })
     end)
