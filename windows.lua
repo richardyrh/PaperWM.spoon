@@ -1,4 +1,3 @@
-local Rect <const> = hs.geometry.rect
 local Screen <const> = hs.screen
 local Spaces <const> = hs.spaces
 local Timer <const> = hs.timer
@@ -95,7 +94,7 @@ function Windows.getCanvas(screen)
     local top_gap = Windows.getGap("top")
     local bottom_gap = Windows.getGap("bottom")
 
-    return Rect(
+    return hs.geometry.rect(
         screen_frame.x + left_gap,
         screen_frame.y + top_gap,
         screen_frame.w - (left_gap + right_gap),
@@ -119,16 +118,12 @@ end
 ---@param space Space
 ---@param windows Window[]
 function Windows.updateVirtualPositions(space, windows, x)
-    if Windows.PaperWM.swipe_fingers == 0 then return false end
     if not Windows.PaperWM.state.x_positions[space] then
         Windows.PaperWM.state.x_positions[space] = {}
     end
     local updated = false
     for _, window in ipairs(windows) do
-        if Windows.PaperWM.state.x_positions[space][window] ~= x then
-            updated = true
-            Windows.PaperWM.state.x_positions[space][window] = x
-        end
+        Windows.PaperWM.state.x_positions[space][window:id()] = x
     end
     return updated
 end
@@ -267,8 +262,10 @@ function Windows.addWindow(add_window)
         local x = add_window:frame().center.x
         for col, windows in ipairs(Windows.PaperWM.state.window_list[space]) do
             if x < windows[1]:frame().center.x then
-                add_column = col
-                break
+                add_column = col     -- insert left of window
+                break                -- add_window will take this window's column
+            else                     -- everything after insert column will be pushed right
+                add_column = col + 1 -- insert right of window
             end
         end
     end
@@ -321,12 +318,13 @@ function Windows.removeWindow(remove_window, skip_new_window_focus)
     Windows.PaperWM.state.ui_watchers[remove_window:id()] = nil
 
     -- clear window position
-    local xposs = Windows.PaperWM.state.x_positions
-    if xposs[remove_index.space] and xposs[remove_index.space][remove_window] then
-        xposs[remove_index.space][remove_window] = nil
-    else
-        print("well shit")
-    end
+    -- local xposs = Windows.PaperWM.state.x_positions
+    -- if xposs[remove_index.space] and xposs[remove_index.space][remove_window] then
+    --     xposs[remove_index.space][remove_window] = nil
+    -- else
+    --     print("well shit")
+    -- end
+    (Windows.PaperWM.state.x_positions[remove_index.space] or {})[remove_window:id()] = nil
 
     -- update index table
     Windows.PaperWM.state.index_table[remove_window:id()] = nil
@@ -362,7 +360,7 @@ function Windows.removeWindowIndex(remove_index, remove_id)
     else
         for i, xpos in pairs(xposs) do
             for w, _ in pairs(xpos) do
-                if w:id() == remove_id then
+                if w == remove_id then
                     print("Removed")
                     xpos[w] = nil
                 end
@@ -610,7 +608,6 @@ end
 ---exchange two columns of windows
 ---@param direction Direction Direction.LEFT or Direction.RIGHT
 function Windows.swapColumns(direction)
-    print("typeof direction ", type(direction), " value ", hs.inspect(direction))
     -- use focused window as source window
     local focused_window = Window.focusedWindow()
     if not focused_window then
@@ -1029,8 +1026,9 @@ function Windows.moveWindow(window, frame)
 end
 
 ---add or remove focused window from the floating layer and retile the space
-function Windows.toggleFloating()
-    local window = Window.focusedWindow()
+---@param window Window|nil optional window to float and focus
+function Windows.toggleFloating(window)
+    window = window or Window.focusedWindow()
     if not window then
         Windows.PaperWM.logger.d("focused window not found")
         return
@@ -1052,6 +1050,7 @@ function Windows.toggleFloating()
         end
     end)()
     if space then
+        window:focus()
         Windows.PaperWM:tileSpace(space)
     end
 end

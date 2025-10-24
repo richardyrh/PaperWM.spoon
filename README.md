@@ -19,7 +19,7 @@ https://github.com/mogenson/PaperWM.spoon ~/.hammerspoon/Spoons/PaperWM.spoon`.
 "Mission Control", then uncheck "Automatically rearrange Spaces based on most
 recent use" and check "Displays have separate Spaces".
 
-<img width="780" alt="Screenshot of macOS settings" src="https://github.com/user-attachments/assets/b0842c44-2a3b-43fc-85eb-66729cd7f8db">
+<img width="780" src="https://github.com/user-attachments/assets/b0842c44-2a3b-43fc-85eb-66729cd7f8db">
 
 ### Install with [SpoonInstall](https://www.hammerspoon.org/Spoons/SpoonInstall.html)
 
@@ -37,7 +37,7 @@ spoon.SpoonInstall:andUse("PaperWM", {
     config = { screen_margin = 16, window_gap = 2 },
     start = true,
     hotkeys = {
-		< see below >
+        < see below >
     }
 })
 ```
@@ -178,6 +178,14 @@ PaperWM.window_filter:setScreens({ "Built%-in Retina Display" })
 PaperWM:start()
 ```
 
+Set `PaperWM.center_mouse` to control whether the mouse cursor is centered on
+the screen after switching spaces. Default is `true`. Example:
+
+```lua
+-- disable mouse centering when switching spaces
+PaperWM.center_mouse = false
+```
+
 Set `PaperWM.window_ratios` to the ratios to cycle window widths and heights
 through. For example:
 
@@ -203,6 +211,25 @@ PaperWM.swipe_gain = 1.0
 
 Inspired by [ScrollDesktop.spoon](https://github.com/jocap/ScrollDesktop.spoon)
 
+### Mouse Dragging
+
+https://github.com/user-attachments/assets/61a0afda-93e6-41b3-963c-7681a4bbe7c7
+
+Click and drag a window with the mouse while holding the `PaperWM.drag_window`
+hotkey to slide and reposition all the windows on a space.
+
+Click on a window with the `PaperWM.lift_window` hotkey held to lift it up, drag
+to move the window, and release the mouse to drop it in a new tiled location.
+This is useful for moving a window to a new screen.
+
+```lua
+-- set to a table of modifier keys to enable window dragging, default is nil
+PaperWM.drag_window = { "alt", "cmd" }`
+
+-- set to a table of modifier keys to enable window lifting, default is nil
+PaperWM.lift_window = { "alt", "cmd", "shift" }
+```
+
 ## Limitations
 
 MacOS does not allow a window to be moved fully off-screen. Windows that would
@@ -217,15 +244,19 @@ Arrange screens vertically to prevent windows from bleeding into other screens.
 Use [WarpMouse.spoon](https://github.com/mogenson/WarpMouse.spoon) to simulate
 side-by-side screens.
 
-<img width="780" alt="Screen Shot 2022-01-07 at 14 18 27" src="https://user-images.githubusercontent.com/900731/148595785-546f9086-9add-4731-8477-233b202378f4.png">
+<img width="780" src="https://user-images.githubusercontent.com/900731/148595785-546f9086-9add-4731-8477-233b202378f4.png">
 
 ## Add-ons
 
 The following spoons compliment PaperWM.spoon nicely.
 
-- [ActiveSpace.spoon](https://github.com/mogenson/ActiveSpace.spoon) Show active and layout of Mission Control spaces in the menu bar.
-- [WarpMouse.spoon](https://github.com/mogenson/WarpMouse.spoon) Move mouse cursor between screen edges to simulate side-by-side screens.
-- [Swipe.spoon](https://github.com/mogenson/Swipe.spoon) Perform actions when trackpad swipe gestures are recognized. Here's an example config to change PaperWM.spoon focused window:
+- [ActiveSpace.spoon](https://github.com/mogenson/ActiveSpace.spoon) Show active
+and layout of Mission Control spaces in the menu bar.
+- [WarpMouse.spoon](https://github.com/mogenson/WarpMouse.spoon) Move mouse
+cursor between screen edges to simulate side-by-side screens.
+- [Swipe.spoon](https://github.com/mogenson/Swipe.spoon) Perform actions when
+trackpad swipe gestures are recognized. Here's an example config to change
+PaperWM.spoon focused window:
 ```lua
 -- focus adjacent window with 3 finger swipe
 local actions = PaperWM.actions.actions()
@@ -253,6 +284,8 @@ Swipe:start(3, function(direction, distance, id)
     end
 end)
 ```
+- [FocusMode.spoon](https://github.com/selimacerbas/FocusMode.spoon) Helps you
+stay in flow by dimming everything except what you’re working on.
 
 ## Contributing
 
@@ -261,8 +294,12 @@ Contributions are welcome! Here are a few preferences:
 - Local variables are `snake_case` (eg. `local focused_window`)
 - Function names are `camelCase` (eg. `function windowEventHandler()`)
 - Use `<const>` where possible
-- Create a local copy when deeply nested members are used often (eg. `local Watcher <const> = hs.uielement.watcher`)
+- Create a local copy when deeply nested members are used often (eg. `local
+Watcher <const> = hs.uielement.watcher`)
 
 Code format checking and linting is provided by
 [lua-language-server](https://github.com/LuaLS/lua-language-server) for commits
 and pull requests. Run `lua-language-server --check .` locally before commiting.
+
+[Busted](https://lunarmodules.github.io/busted/) is used for unit testing. Run
+`busted` from the repo root to run tests locally.
