@@ -155,11 +155,11 @@ function Events.windowEventHandler(window, event, self)
             end
 
             local focused_window = Window.focusedWindow()
+            local focused_index = self.state.index_table[focused_window]
             hs.printf(hs.inspect(focused_window))
 
-            if focused_window then
+            if focused_index then
                 print("trying to focus")
-                local focused_index = self.state.index_table[focused_window]
                 local screen = Screen(Spaces.spaceDisplay(focused_index.space))
                 local frame = focused_window:frame()
 
@@ -178,8 +178,16 @@ function Events.windowEventHandler(window, event, self)
                     visible_window:focus()
                 end
             else
-                print("no focused windows!!!!!")
+                -- local screen = Screen(Spaces.spaceDisplay(cspace))
+                -- print(hs.inspect(screen))
+                -- local anchor_window = Events.PaperWM.windows.getFirstVisibleWindow(cspace, screen:frame())
+
+                -- if anchor_window then
+                --     anchor_window:focus()
+                -- end
             end
+
+
             -- -- find anchor window
             -- local focused_window = hs.window.focusedWindow()
             -- local anchor_window = (function()
@@ -304,12 +312,6 @@ function Events.swipeHandler(self)
     ---@param dy number change in vertical position since last callback: between 0 and 1
     return function(id, type, dx, dy)
         if type == Events.Swipe.BEGIN then
-            self.logger.df("new swipe: %d", id)
-            hs.printf("swipe start\n");
-
-            -- if PaperWMHUD then
-            --     PaperWMHUD.show(true, false)
-            -- end
 
             -- use focused window for space to scroll windows
             local focused_window = Window.focusedWindow()

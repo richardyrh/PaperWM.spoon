@@ -440,10 +440,6 @@ function Windows.focusWindow(direction, focused_index)
 
     -- focus new window, windowFocused event will be emited immediately
     new_focused_window:focus()
-            
-    if PaperWMHUD then
-        PaperWMHUD.show(true, true)
-    end
 
     -- try to prevent MacOS from stealing focus away to another window
     Timer.doAfter(Window.animationDuration, function()
@@ -452,10 +448,6 @@ function Windows.focusWindow(direction, focused_index)
             new_focused_window:focus()
         end
     end)
-
-    if PaperWMHUD then
-        PaperWMHUD.refresh()
-    end
 
     return new_focused_window
 end

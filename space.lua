@@ -125,9 +125,9 @@ function Space.tileSpace(space)
         Space.PaperWM.windows.updateVirtualPositions(space, column, x2 - width)
         x2 = x2 - width - left_gap
     end
-        
-    if PaperWMHUD and updated then
-        PaperWMHUD.show(true, true)
+    
+    if Space.PaperWM.hud then
+        Space.PaperWM.hud.update()
     end
 end
 
