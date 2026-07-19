@@ -61,6 +61,10 @@ Config.window_gap = 8 ---@type number|{ top: number, bottom: number, left: numbe
 ---ratios to use when cycling widths and heights, golden ratio by default
 Config.window_ratios = { 0.23607, 0.38195, 0.61804 } ---@type number[]
 
+---window animation backend: "accessibility" or experimental "native"
+---the native backend automatically falls back when its SkyLight helper is unavailable
+Config.animation_backend = "native" ---@type "accessibility"|"native"
+
 ---size of the on-screen margin to place off-screen windows
 Config.screen_margin = 1 ---@type number
 

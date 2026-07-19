@@ -15,6 +15,22 @@ local WindowFilter <const> = hs.window.filter
 local Events = {}
 Events.__index = Events
 
+-- Window creation commonly emits windowVisible, windowFocused, and
+-- windowsChanged back-to-back. Tile once after that burst instead of starting
+-- and replacing several animations in the same run-loop turn.
+local pending_layout_timers = {}
+local layout_debounce <const> = 0.015
+
+local function scheduleTile(self, space)
+    local pending = pending_layout_timers[space]
+    if pending then pending:stop() end
+
+    pending_layout_timers[space] = Timer.doAfter(layout_debounce, function()
+        pending_layout_timers[space] = nil
+        self.space.tileSpace(space)
+    end)
+end
+
 ---initialize module with reference to PaperWM
 ---@param paperwm PaperWM
 function Events.init(paperwm)
@@ -35,28 +51,6 @@ local screen_watcher = Screen.watcher.new((function()
         end
     end
 end)())
-
-function count(tb)
-    if tb then
-        local c = 0
-        for _, x in pairs(tb) do
-            c = c + 1
-        end
-        return c
-    else
-        return 0
-    end
-end
-
-local function has_value (tab, val)
-    for index, value in ipairs(tab) do
-        if value == val then
-            return true
-        end
-    end
-
-    return false
-end
 
 ---callback for window events
 ---@param window Window
@@ -119,101 +113,47 @@ function Events.windowEventHandler(window, event, self)
         space = self.windows.removeWindow(window, true) -- don't focus new window if fullscreened
     elseif event == "AXWindowMoved" or event == "AXWindowResized" then
         space = Spaces.windowSpaces(window)[1]
-    else
-        print("event", event)
+    elseif event == "windowsChanged" or event == "windowNotInCurrentSpace" then
         local all_windows = self.windows.PaperWM.window_filter:getWindows()
+        local allowed_ids = {}
+        for _, allowed_window in ipairs(all_windows) do
+            allowed_ids[allowed_window:id()] = true
+        end
 
-        local retile_spaces = {} -- spaces that need to be retiled
-
-        local cspace = hs.spaces.focusedSpace()
-        local ac = #all_windows
-        local bc = count(self.state.x_positions[cspace])
-        local cc = count(self.state.index_table)
-        hs.printf("I see %d windows in the filter list, %d in xpos, %d in the index table\n", ac, bc, cc)
-        -- if ac ~= bc or bc ~= cc or ac ~= cc then
-        -- end
-        if event == "windowsChanged" or event == "windowNotInCurrentSpace" then
-            -- print("cleanup start")
-            -- print("all windows", hs.inspect(all_windows))
-            -- print("x pos", hs.inspect(self.windows.PaperWM.state.x_positions))
-            -- print("index table", hs.inspect(self.state.index_table))
-            -- print("=================")
-            for wid, widx in pairs(self.state.index_table) do
-                local exists = false
-                for _, aw in ipairs(all_windows) do
-                    -- print(aw:screen():id())
-                    -- print(hs.inspect(window))
-                    if aw:id() == wid then
-                        exists = true
-                    end
-                end
-                if not exists then
-                    print("i want to kick out window", wid, hs.inspect(widx))
-                    space = self.windows.removeWindowIndex(widx, wid)
-                end
-
+        -- Collect before removing because removeWindowIndex mutates index_table.
+        local removed = {}
+        for id, index in pairs(self.state.index_table) do
+            if not allowed_ids[id] then
+                table.insert(removed, { id = id, index = index })
             end
+        end
+        for _, item in ipairs(removed) do
+            local removed_space = self.windows.removeWindowIndex(item.index, item.id)
+            if removed_space then scheduleTile(self, removed_space) end
+        end
 
-            local focused_window = Window.focusedWindow()
-            hs.printf(hs.inspect(focused_window))
-
-            if focused_window then
-                print("trying to focus")
-                local focused_index = self.state.index_table[focused_window]
-                local screen = Screen(Spaces.spaceDisplay(focused_index.space))
-                local frame = focused_window:frame()
-
+        local focused_window = Window.focusedWindow()
+        local focused_index = focused_window and self.state.index_table[focused_window:id()]
+        if focused_index then
+            local screen = Screen(Spaces.spaceDisplay(focused_index.space))
+            if screen then
+                local frame = self.windows.getWindowFrame(focused_window)
                 local screen_frame = screen:frame()
                 local visible_window = (function()
                     if frame.x < screen_frame.x then
-                        return self.windows.getFirstVisibleWindow(space, screen_frame,
+                        return self.windows.getFirstVisibleWindow(focused_index.space, screen_frame,
                             self.windows.Direction.LEFT)
                     elseif frame.x2 > screen_frame.x2 then
-                        return self.windows.getFirstVisibleWindow(space, screen_frame,
+                        return self.windows.getFirstVisibleWindow(focused_index.space, screen_frame,
                             self.windows.Direction.RIGHT)
                     end
                 end)()
-                if visible_window then
-                    print("focusing")
-                    visible_window:focus()
-                end
-            else
-                print("no focused windows!!!!!")
+                if visible_window then visible_window:focus() end
             end
-            -- -- find anchor window
-            -- local focused_window = hs.window.focusedWindow()
-            -- local anchor_window = (function()
-            --     if focused_window and not Windows.PaperWM.state.is_floating[focused_window:id()] and Spaces.windowSpaces(focused_window)[1] == space then
-            --         return focused_window
-            --     else
-            --         return self.windows.getFirstVisibleWindow(space, screen:frame())
-            --     end
-            -- end)()
-
         end
-
-        -- for _, window in ipairs(all_windows) do
-        --     local index = self.state.index_table[window:id()]
-        --     if Windows.PaperWM.state.is_floating[window:id()] then
-        --         -- ignore floating windows
-        --     elseif not index then
-        --         -- add window
-        --         local space = Windows.addWindow(window)
-        --         if space then retile_spaces[space] = true end
-        --     elseif index.space ~= Spaces.windowSpaces(window)[1] then
-        --         -- move to window list in new space, don't focus nearby window
-        --         Windows.removeWindow(window, true)
-        --         local space = Windows.addWindow(window)
-        --         if space then retile_spaces[space] = true end
-        --     end
-        -- end
-    
-        -- -- retile spaces
-        -- for space, _ in pairs(retile_spaces) do Windows.PaperWM:tileSpace(space) end
-
     end
 
-    if space then self.space.tileSpace(space) end
+    if space then scheduleTile(self, space) end
 end
 
 ---coroutine to slide all windows in a space by dx
@@ -230,19 +170,13 @@ local function slide_windows(self, space, screen_frame)
     for id, x in pairs(self.state.x_positions[space] or {}) do
         local window = Window(id)
         if window then
-            -- local app = window:application()
-            -- if app then
-            --     local ax_app = hs.axuielement.applicationElement(app)
-            --     if ax_app then
-            --         ax_app.AXEnhancedUserInterface = false
-            --     end
-            -- end
             local watcher = self.state.ui_watchers[id]
             if watcher then watcher:stop() end
             local frame = window:frame()
             table.insert(windows, { window = window, frame = frame, x = x })
         end
     end
+    local compositor_active = self.windows.beginInteractiveMove(windows)
 
     while true do
         local dx = coroutine.yield()
@@ -252,10 +186,18 @@ local function slide_windows(self, space, screen_frame)
             for _, item in ipairs(windows) do
                 item.x = item.x + dx                               -- scroll left or right
                 item.frame.x = dx > 0 and math.min(item.x, right_margin) or math.max(item.x, left_margin - item.frame.w)
-                item.window:setTopLeft(item.frame.x, item.frame.y) -- avoid the animationDuration
+            end
+            if compositor_active then
+                compositor_active = self.windows.updateInteractiveMove(windows)
+            else
+                for _, item in ipairs(windows) do
+                    item.window:setTopLeft(item.frame.x, item.frame.y)
+                end
             end
         end
     end
+
+    if compositor_active then self.windows.endInteractiveMove() end
 
     -- start window watchers
     for _, item in ipairs(windows) do
@@ -304,12 +246,6 @@ function Events.swipeHandler(self)
     ---@param dy number change in vertical position since last callback: between 0 and 1
     return function(id, type, dx, dy)
         if type == Events.Swipe.BEGIN then
-            self.logger.df("new swipe: %d", id)
-            hs.printf("swipe start\n");
-
-            -- if PaperWMHUD then
-            --     PaperWMHUD.show(true, false)
-            -- end
 
             -- use focused window for space to scroll windows
             local focused_window = Window.focusedWindow()
@@ -349,7 +285,7 @@ end
 ---generate callback function for mouse events
 ---@param self PaperWM
 function Events.mouseHandler(self)
-    local lift_window, drag_coro = nil, nil
+    local lift_window, lift_items, lift_compositor, drag_coro = nil, nil, false, nil
 
     ---find a Window under the mouse cursor
     ---@param event userdata
@@ -395,7 +331,11 @@ function Events.mouseHandler(self)
             elseif self.lift_window and flags:containExactly(self.lift_window) then
                 -- get window from cursor location, set window to floating, tile
                 lift_window = windowUnderCursor(event)
-                if lift_window then self.windows.toggleFloating(lift_window) end
+                if lift_window then
+                    self.windows.toggleFloating(lift_window)
+                    lift_items = { { window = lift_window, frame = lift_window:frame() } }
+                    lift_compositor = self.windows.beginInteractiveMove(lift_items)
+                end
                 self.logger.df("lift window start for: %s", lift_window)
                 delete_event = true
             end
@@ -404,11 +344,14 @@ function Events.mouseHandler(self)
                 drag_coro(event:getProperty(MouseEventDeltaX))
                 delete_event = true
             elseif lift_window then
-                local frame = lift_window:frame()
-                lift_window:setTopLeft(
-                    frame.x + event:getProperty(MouseEventDeltaX),
-                    frame.y + event:getProperty(MouseEventDeltaY)
-                )
+                local frame = lift_items[1].frame
+                frame.x = frame.x + event:getProperty(MouseEventDeltaX)
+                frame.y = frame.y + event:getProperty(MouseEventDeltaY)
+                if lift_compositor then
+                    lift_compositor = self.windows.updateInteractiveMove(lift_items)
+                else
+                    lift_window:setTopLeft(frame.x, frame.y)
+                end
                 delete_event = true
             end
         elseif type == LeftMouseUp then
@@ -420,8 +363,11 @@ function Events.mouseHandler(self)
             elseif lift_window then
                 -- set window to not floating, tile
                 self.logger.df("lift window stop")
+                if lift_compositor then self.windows.endInteractiveMove() end
                 self.windows.toggleFloating(lift_window)
                 lift_window = nil
+                lift_items = nil
+                lift_compositor = false
                 delete_event = true
             end
         end
@@ -462,6 +408,10 @@ function Events.stop()
     Events.PaperWM.window_filter:unsubscribeAll()
     for _, watcher in pairs(Events.PaperWM.state.ui_watchers) do watcher:stop() end
     screen_watcher:stop()
+    for space, timer in pairs(pending_layout_timers) do
+        timer:stop()
+        pending_layout_timers[space] = nil
+    end
 
     -- stop listening for touchpad swipes
     Events.Swipe:stop()

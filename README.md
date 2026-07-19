@@ -166,6 +166,26 @@ PaperWM.window_gap = 10
 PaperWM.window_gap  =  { top = 10, bottom = 8, left = 12, right = 12 }
 ```
 
+### Experimental native animations
+
+PaperWM can animate window position and size changes, including interactive
+swipe scrolling, using WindowServer presentation transforms instead of sending
+an Accessibility update for every frame. This uses private, undocumented macOS
+APIs and may stop working after an OS update.
+
+Build the helper for the installed Hammerspoon:
+
+```sh
+make -C ~/.hammerspoon/Spoons/PaperWM.spoon/native
+```
+
+```lua
+PaperWM.animation_backend = "native" -- default for this experimental build
+```
+
+Use `"accessibility"` to select the standard path. If the helper cannot load or
+SkyLight rejects a transform, PaperWM falls back to Accessibility animation.
+
 Configure the `PaperWM.window_filter` to set which apps and screens are managed.
 For example:
 

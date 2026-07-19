@@ -7,6 +7,344 @@ local Window <const> = hs.window
 local Windows = {}
 Windows.__index = Windows
 
+-- A config reload can otherwise abandon a presentation transform owned by the
+-- previous copy of this module.
+if type(_G.PaperWMNativeAnimationCleanup) == "function" then
+    pcall(_G.PaperWMNativeAnimationCleanup)
+end
+_G.PaperWMNativeAnimationCleanup = nil
+
+-- hs.window's generic frame animator writes size, position, then size again on
+-- every tick. PaperWM usually only changes a window's position while moving
+-- focus, so use a single position write for that common path.
+local position_animations = {}
+local position_animation_timer = nil
+local move_generations = {}
+local animation_interval <const> = 1 / 60
+local watcher_restart_padding <const> = 0.02
+
+local function easeProgress(progress)
+    -- Keep the soft cubic landing, but add a short, mild acceleration ramp.
+    return 1 - ((1 - (progress ^ 1.15)) ^ 3)
+end
+
+local function watcherEvents()
+    return { Watcher.windowMoved, Watcher.windowResized }
+end
+
+local function startWatcher(id, watcher, generation)
+    if move_generations[id] == generation and
+        Windows.PaperWM.state.ui_watchers[id] == watcher then
+        watcher:start(watcherEvents())
+    end
+end
+
+local function restartWatcherAfter(delay, id, watcher, generation)
+    Timer.doAfter(delay, function()
+        startWatcher(id, watcher, generation)
+    end)
+end
+
+local function stopPositionAnimation(id)
+    position_animations[id] = nil
+    if position_animation_timer and not next(position_animations) then
+        position_animation_timer:stop()
+        position_animation_timer = nil
+    end
+end
+
+local function stopAllPositionAnimations(set_real_positions)
+    for id, animation in pairs(position_animations) do
+        if set_real_positions then
+            pcall(animation.window.setTopLeft, animation.window,
+                animation.end_frame.x, animation.end_frame.y)
+        end
+        position_animations[id] = nil
+        restartWatcherAfter(watcher_restart_padding, id,
+            animation.watcher, animation.generation)
+    end
+
+    if position_animation_timer then
+        position_animation_timer:stop()
+        position_animation_timer = nil
+    end
+end
+
+local function animatePositions()
+    local now = Timer.secondsSinceEpoch()
+
+    for id, animation in pairs(position_animations) do
+        if move_generations[id] ~= animation.generation or
+            Windows.PaperWM.state.ui_watchers[id] ~= animation.watcher then
+            position_animations[id] = nil
+        else
+            local progress = math.min(1, (now - animation.started_at) / animation.duration)
+            local eased = easeProgress(progress)
+            local x = animation.start_frame.x +
+                ((animation.end_frame.x - animation.start_frame.x) * eased)
+            local y = animation.start_frame.y +
+                ((animation.end_frame.y - animation.start_frame.y) * eased)
+            local ok = pcall(animation.window.setTopLeft, animation.window, x, y)
+
+            if not ok or progress >= 1 then
+                position_animations[id] = nil
+                restartWatcherAfter(watcher_restart_padding, id, animation.watcher,
+                    animation.generation)
+            end
+        end
+    end
+
+    if not next(position_animations) and position_animation_timer then
+        position_animation_timer:stop()
+        position_animation_timer = nil
+    end
+end
+
+local function animatePosition(window, start_frame, end_frame, watcher, generation)
+    local id = window:id()
+    position_animations[id] = {
+        window = window,
+        start_frame = start_frame,
+        end_frame = end_frame,
+        watcher = watcher,
+        generation = generation,
+        started_at = Timer.secondsSinceEpoch(),
+        duration = Window.animationDuration,
+    }
+
+    if not position_animation_timer then
+        position_animation_timer = Timer.new(animation_interval, animatePositions)
+        position_animation_timer:start()
+    end
+end
+
+-- Optional compositor backend. The helper applies private SkyLight
+-- presentation transforms; real Accessibility positions are committed only
+-- once, under a short WindowServer update lock, when the animation finishes.
+local native_transform = nil
+local native_transform_checked = false
+local native_transform_error = nil
+local native_animations = {}
+local native_animation_timer = nil
+local interactive_moves = nil
+
+local function loadNativeTransform()
+    if native_transform_checked then return native_transform end
+    native_transform_checked = true
+
+    if not hs.spoons or not hs.spoons.resourcePath then
+        native_transform_error = "hs.spoons.resourcePath is unavailable"
+        return nil
+    end
+
+    local path = hs.spoons.resourcePath("native/paperwm_transform.so")
+    local loader, load_error = package.loadlib(path, "luaopen_paperwm_transform")
+    if not loader then
+        native_transform_error = load_error
+        return nil
+    end
+
+    local loaded, transform = pcall(loader)
+    if not loaded then
+        native_transform_error = transform
+        return nil
+    end
+
+    local checked, available, reason = pcall(transform.available)
+    if not checked or not available then
+        native_transform_error = checked and reason or available
+        return nil
+    end
+
+    native_transform = transform
+    return native_transform
+end
+
+local function nativeCall(method, ...)
+    local transform = loadNativeTransform()
+    if not transform then return false, native_transform_error end
+
+    local called, result, reason = pcall(transform[method], ...)
+    if not called then return false, result end
+    if not result then return false, reason end
+    return true
+end
+
+local function identityTransforms(records)
+    local transforms = {}
+    for _, animation in ipairs(records) do
+        table.insert(transforms, { id = animation.id, sx = 1, sy = 1, tx = 0, ty = 0 })
+    end
+    return transforms
+end
+
+local function commitNativeAnimations(records, set_real_positions)
+    if #records == 0 then return end
+
+    local updates_disabled = nativeCall("beginUpdates")
+    if set_real_positions then
+        for _, animation in ipairs(records) do
+            pcall(animation.window.setFrame, animation.window, animation.end_frame, 0)
+        end
+    end
+    local reset_ok, reset_error = nativeCall("set", identityTransforms(records))
+    if updates_disabled then nativeCall("endUpdates") end
+
+    if not reset_ok and Windows.PaperWM then
+        Windows.PaperWM.logger.ef("could not reset native transforms: %s", reset_error)
+    end
+
+    for _, animation in ipairs(records) do
+        native_animations[animation.id] = nil
+        restartWatcherAfter(watcher_restart_padding, animation.id,
+            animation.watcher, animation.generation)
+    end
+end
+
+
+local function stopNativeAnimation(id, set_real_position)
+    local animation = native_animations[id]
+    if animation then commitNativeAnimations({ animation }, set_real_position) end
+
+    if native_animation_timer and not next(native_animations) then
+        native_animation_timer:stop()
+        native_animation_timer = nil
+    end
+end
+
+local function stopAllNativeAnimations(set_real_positions)
+    local animations = {}
+    for _, animation in pairs(native_animations) do table.insert(animations, animation) end
+    commitNativeAnimations(animations, set_real_positions)
+    if native_animation_timer then
+        native_animation_timer:stop()
+        native_animation_timer = nil
+    end
+end
+
+local function animateNativeFrames()
+    local now = Timer.secondsSinceEpoch()
+    local transforms, finished, abandoned = {}, {}, {}
+
+    for id, animation in pairs(native_animations) do
+        if move_generations[id] ~= animation.generation or
+            Windows.PaperWM.state.ui_watchers[id] ~= animation.watcher then
+            table.insert(abandoned, animation)
+        else
+            local progress = math.min(1, (now - animation.started_at) / animation.duration)
+            local eased = easeProgress(progress)
+            animation.x = animation.start_x + ((animation.end_frame.x - animation.start_x) * eased)
+            animation.y = animation.start_y + ((animation.end_frame.y - animation.start_y) * eased)
+            animation.sx = animation.start_sx + ((animation.end_sx - animation.start_sx) * eased)
+            animation.sy = animation.start_sy + ((animation.end_sy - animation.start_sy) * eased)
+
+            -- CGS applies the affine transform in global screen coordinates.
+            -- Offset scaling around the origin so the presented top-left follows
+            -- the independently interpolated x/y path.
+            animation.tx = animation.x - (animation.real_frame.x * animation.sx)
+            animation.ty = animation.y - (animation.real_frame.y * animation.sy)
+            table.insert(transforms, {
+                id = id,
+                sx = animation.sx,
+                sy = animation.sy,
+                tx = animation.tx,
+                ty = animation.ty,
+            })
+            if progress >= 1 then table.insert(finished, animation) end
+        end
+    end
+
+    if #abandoned > 0 then commitNativeAnimations(abandoned, false) end
+
+    if #transforms > 0 then
+        local transformed, reason = nativeCall("set", transforms)
+        if not transformed then
+            native_transform_error = reason
+            stopAllNativeAnimations(true)
+            Windows.PaperWM.logger.ef(
+                "native animation failed; falling back to Accessibility: %s", reason)
+            return
+        end
+    end
+
+    if #finished > 0 then commitNativeAnimations(finished, true) end
+
+    if not next(native_animations) and native_animation_timer then
+        native_animation_timer:stop()
+        native_animation_timer = nil
+    end
+end
+
+local function animateNativeFrame(window, real_frame, end_frame, watcher, generation)
+    local id = window:id()
+    local previous = native_animations[id]
+    local start_x = previous and previous.x or real_frame.x
+    local start_y = previous and previous.y or real_frame.y
+    local start_sx = previous and previous.sx or 1
+    local start_sy = previous and previous.sy or 1
+
+    native_animations[id] = {
+        id = id,
+        window = window,
+        real_frame = real_frame,
+        end_frame = end_frame,
+        watcher = watcher,
+        generation = generation,
+        start_x = start_x,
+        start_y = start_y,
+        start_sx = start_sx,
+        start_sy = start_sy,
+        end_sx = end_frame.w / real_frame.w,
+        end_sy = end_frame.h / real_frame.h,
+        x = start_x,
+        y = start_y,
+        sx = start_sx,
+        sy = start_sy,
+        tx = start_x - (real_frame.x * start_sx),
+        ty = start_y - (real_frame.y * start_sy),
+        started_at = Timer.secondsSinceEpoch(),
+        duration = Window.animationDuration,
+    }
+
+    if not native_animation_timer then
+        native_animation_timer = Timer.new(animation_interval, animateNativeFrames)
+        native_animation_timer:start()
+    end
+end
+
+local function nativeBackendEnabled()
+    return Windows.PaperWM.animation_backend == "native" and
+        native_transform_error == nil and loadNativeTransform() ~= nil
+end
+
+local function finishInteractiveMove(set_real_positions)
+    if not interactive_moves then return end
+
+    local records = {}
+    for _, record in pairs(interactive_moves) do table.insert(records, record) end
+
+    local updates_disabled = nativeCall("beginUpdates")
+    if set_real_positions then
+        for _, record in ipairs(records) do
+            pcall(record.window.setTopLeft, record.window,
+                record.end_frame.x, record.end_frame.y)
+        end
+    end
+    local reset_ok, reset_error = nativeCall("set", identityTransforms(records))
+    if updates_disabled then nativeCall("endUpdates") end
+    interactive_moves = nil
+
+    if not reset_ok and Windows.PaperWM then
+        Windows.PaperWM.logger.ef(
+            "could not reset interactive native transforms: %s", reset_error)
+    end
+end
+
+_G.PaperWMNativeAnimationCleanup = function()
+    stopAllNativeAnimations(true)
+    finishInteractiveMove(true)
+end
+
 ---@enum Direction
 local Direction <const> = {
     LEFT = -1,
@@ -42,9 +380,9 @@ function Windows.getFirstVisibleWindow(space, screen_frame, direction)
         local window = windows[1] -- take first window in column
         local d = (function()
             if direction == Direction.LEFT then
-                return window:frame().x - screen_frame.x
+                return Windows.getWindowFrame(window).x - screen_frame.x
             elseif direction == Direction.RIGHT then
-                return screen_frame.x2 - window:frame().x2
+                return screen_frame.x2 - Windows.getWindowFrame(window).x2
             end
         end)() or math.huge
         if d >= 0 and d < distance then
@@ -53,6 +391,90 @@ function Windows.getFirstVisibleWindow(space, screen_frame, direction)
         end
     end
     return closest
+end
+
+---return the destination frame while a lightweight position animation is active
+---@param window Window
+---@return Frame
+function Windows.getWindowFrame(window)
+    local id = window:id()
+    local animation = native_animations[id] or position_animations[id] or
+        (interactive_moves and interactive_moves[id])
+    local frame = animation and animation.end_frame or window:frame()
+    return hs.geometry.rect(frame.x, frame.y, frame.w, frame.h)
+end
+
+---report whether the experimental native animation helper can be used
+---@return boolean
+---@return string|nil
+function Windows.nativeAnimationStatus()
+    if loadNativeTransform() then return true, nil end
+    return false, native_transform_error
+end
+
+---begin a compositor-backed interactive position gesture
+---@param items table[] tables containing a window and its current frame
+---@return boolean
+function Windows.beginInteractiveMove(items)
+    if not nativeBackendEnabled() then return false end
+
+    finishInteractiveMove(true)
+    stopAllNativeAnimations(true)
+    stopAllPositionAnimations(true)
+    interactive_moves = {}
+
+    for _, item in ipairs(items) do
+        local id = item.window:id()
+        -- Invalidate any delayed watcher restart left by an interrupted
+        -- animation; the gesture owner restarts its watchers when it ends.
+        move_generations[id] = (move_generations[id] or 0) + 1
+        local frame = item.window:frame()
+        item.frame = hs.geometry.rect(frame.x, frame.y, frame.w, frame.h)
+        interactive_moves[id] = {
+            id = id,
+            window = item.window,
+            real_frame = frame,
+            end_frame = hs.geometry.rect(frame.x, frame.y, frame.w, frame.h),
+        }
+    end
+    return true
+end
+
+---apply one batched compositor update during an interactive gesture
+---@param items table[] tables containing a window and desired frame
+---@return boolean
+function Windows.updateInteractiveMove(items)
+    if not interactive_moves then return false end
+
+    local transforms = {}
+    for _, item in ipairs(items) do
+        local record = interactive_moves[item.window:id()]
+        if record then
+            record.end_frame.x = item.frame.x
+            record.end_frame.y = item.frame.y
+            table.insert(transforms, {
+                id = record.id,
+                sx = 1,
+                sy = 1,
+                tx = item.frame.x - record.real_frame.x,
+                ty = item.frame.y - record.real_frame.y,
+            })
+        end
+    end
+
+    local transformed, reason = nativeCall("set", transforms)
+    if transformed then return true end
+
+    native_transform_error = reason
+    finishInteractiveMove(true)
+    Windows.PaperWM.logger.ef(
+        "interactive native move failed; falling back to Accessibility: %s", reason)
+    return false
+end
+
+---commit and clear an interactive compositor gesture
+function Windows.endInteractiveMove()
+    finishInteractiveMove(true)
 end
 
 ---get a column of windows for a space from the window_list
@@ -150,7 +572,7 @@ function Windows.tileColumn(windows, bounds, h, w, id, h4id)
     local bottom_gap = Windows.getGap("bottom")
 
     for _, window in ipairs(windows) do
-        frame = window:frame()
+        frame = Windows.getWindowFrame(window)
         w = w or frame.w -- take given width or width of first window
         if bounds.x then -- set either left or right x coord
             frame.x = bounds.x
@@ -440,10 +862,6 @@ function Windows.focusWindow(direction, focused_index)
 
     -- focus new window, windowFocused event will be emited immediately
     new_focused_window:focus()
-            
-    if PaperWMHUD then
-        PaperWMHUD.show(true, true)
-    end
 
     -- try to prevent MacOS from stealing focus away to another window
     Timer.doAfter(Window.animationDuration, function()
@@ -452,10 +870,6 @@ function Windows.focusWindow(direction, focused_index)
             new_focused_window:focus()
         end
     end)
-
-    if PaperWMHUD then
-        PaperWMHUD.refresh()
-    end
 
     return new_focused_window
 end
@@ -989,40 +1403,58 @@ end
 ---@param window Window window to move
 ---@param frame Frame coordinates to set window size and location
 function Windows.moveWindow(window, frame)
-    -- greater than 0.017 hs.window animation step time
-    local padding <const> = 0.02
-
-    local watcher = Windows.PaperWM.state.ui_watchers[window:id()]
+    local id = window:id()
+    local watcher = Windows.PaperWM.state.ui_watchers[id]
     if not watcher then
         Windows.PaperWM.logger.e("window does not have ui watcher")
         return
     end
 
-    if frame == window:frame() then
+    if frame == Windows.getWindowFrame(window) then
         Windows.PaperWM.logger.v("no change in window frame")
         return
     end
 
     watcher:stop()
 
-    local app = window:application()
-    if app then
-        local ax_app = hs.axuielement.applicationElement(app)
+    local generation = (move_generations[id] or 0) + 1
+    move_generations[id] = generation
 
-        -- local was_enhanced = ax_app.AXEnhancedUserInterface
-        -- if not was_enhanced then
-        ax_app.AXEnhancedUserInterface = false
-        -- end
+    local current_frame = window:frame()
+    local can_transform = current_frame.w > 0 and current_frame.h > 0
+
+    if can_transform and Window.animationDuration > 0 and nativeBackendEnabled() then
+        stopPositionAnimation(id)
+        animateNativeFrame(window, current_frame, frame, watcher, generation)
+    elseif current_frame.w == frame.w and current_frame.h == frame.h and
+        Window.animationDuration > 0 then
+        stopNativeAnimation(id, true)
+        current_frame = window:frame()
+        local app = window:application()
+        local ax_app = app and hs.axuielement.applicationElement(app)
+        if ax_app and ax_app.AXEnhancedUserInterface then
+            ax_app.AXEnhancedUserInterface = false
+        end
+        animatePosition(window, current_frame, frame, watcher, generation)
+    else
+        stopNativeAnimation(id, true)
+        stopPositionAnimation(id)
+        local app = window:application()
+        local ax_app = app and hs.axuielement.applicationElement(app)
+        if ax_app and ax_app.AXEnhancedUserInterface then
+            ax_app.AXEnhancedUserInterface = false
+        end
+        window:setFrame(frame)
+        restartWatcherAfter(Window.animationDuration + watcher_restart_padding,
+            id, watcher, generation)
     end
+end
 
-    -- https://github.com/Hammerspoon/hammerspoon/issues/3731
-
-    -- set & run action
-    window:setFrame(frame)
-
-    Timer.doAfter(Window.animationDuration + padding, function()
-        watcher:start({ Watcher.windowMoved, Watcher.windowResized })
-    end)
+---finish active presentation transforms and restore real window frames
+function Windows.stopAnimations()
+    finishInteractiveMove(true)
+    stopAllNativeAnimations(true)
+    stopAllPositionAnimations(true)
 end
 
 ---add or remove focused window from the floating layer and retile the space

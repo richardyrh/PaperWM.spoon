@@ -122,6 +122,9 @@ end
 ---stop automatic window tiling
 ---@return PaperWM
 function PaperWM:stop()
+    self.windows.stopAnimations()
+    self.space.stop()
+
     -- stop events
     self.events.stop()
 

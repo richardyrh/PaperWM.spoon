@@ -1,10 +1,20 @@
 local Screen <const> = hs.screen
 local Spaces <const> = hs.spaces
 local Fnutils <const> = hs.fnutils
+local Timer <const> = hs.timer
 local Window <const> = hs.window
 
 local Space = {}
 Space.__index = Space
+local hud_update_timer = nil
+
+local function scheduleHudUpdate()
+    if hud_update_timer then hud_update_timer:stop() end
+    hud_update_timer = Timer.doAfter(Window.animationDuration + 0.02, function()
+        hud_update_timer = nil
+        if Space.PaperWM.hud then Space.PaperWM.hud.update() end
+    end)
+end
 
 ---initialize module with reference to PaperWM
 ---@param paperwm PaperWM
@@ -58,7 +68,7 @@ function Space.tileSpace(space)
     local canvas <const> = Space.PaperWM.windows.getCanvas(screen)
 
     -- make sure anchor window is on screen
-    local anchor_frame = anchor_window:frame()
+    local anchor_frame = Space.PaperWM.windows.getWindowFrame(anchor_window)
     anchor_frame.x = math.max(anchor_frame.x, canvas.x)
     anchor_frame.w = math.min(anchor_frame.w, canvas.w)
     anchor_frame.h = math.min(anchor_frame.h, canvas.h)
@@ -91,7 +101,7 @@ function Space.tileSpace(space)
         Space.PaperWM.windows.tileColumn(column, bounds, h, anchor_frame.w, anchor_window:id(),
             anchor_frame.h)
     end
-    local updated = Space.PaperWM.windows.updateVirtualPositions(space, column, anchor_frame.x)
+    Space.PaperWM.windows.updateVirtualPositions(space, column, anchor_frame.x)
 
     local right_gap = Space.PaperWM.windows.getGap("right")
     local left_gap = Space.PaperWM.windows.getGap("left")
@@ -125,9 +135,15 @@ function Space.tileSpace(space)
         Space.PaperWM.windows.updateVirtualPositions(space, column, x2 - width)
         x2 = x2 - width - left_gap
     end
-        
-    if PaperWMHUD and updated then
-        PaperWMHUD.show(true, true)
+
+    if Space.PaperWM.hud then scheduleHudUpdate() end
+end
+
+---stop delayed work owned by the space module
+function Space.stop()
+    if hud_update_timer then
+        hud_update_timer:stop()
+        hud_update_timer = nil
     end
 end
 
@@ -183,6 +199,10 @@ function Space.moveWindowToSpace(index)
         Space.PaperWM.logger.d("focused window not found")
         return
     end
+
+    -- Mission Control uses blocking waits, so animation timers cannot finish
+    -- during its drag routine. Commit and clear presentation transforms first.
+    Space.PaperWM.windows.stopAnimations()
 
     local new_space = Space.MissionControl:getSpaceID(index)
     if not new_space then
