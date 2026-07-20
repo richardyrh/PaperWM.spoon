@@ -57,7 +57,7 @@ function Cache:set(touches)
 end
 
 function Cache:detect(touches)
-    local moved = true
+    local moved = false
     local delta = { dx = 0, dy = 0 }
     local size = 0
     for i, touch in ipairs(touches) do
@@ -65,7 +65,10 @@ function Cache:detect(touches)
         local x, y = touch.normalizedPosition.x, touch.normalizedPosition.y
         local dx, dy = x - assert(self.touches[id]).x, y - assert(self.touches[id]).y
 
-        moved = moved and (touch.phase == "moved")
+        -- Gesture events commonly mark only the finger that changed as moved;
+        -- stationary fingers still belong to the gesture. Requiring every
+        -- finger to move discarded samples while advancing the cache.
+        moved = moved or (touch.phase == "moved")
         delta = { dx = delta.dx + dx, dy = delta.dy + dy }
         self.touches[id] = { x = x, y = y, dx = dx, dy = dy }
         size = i
@@ -95,15 +98,15 @@ function Swipe:start(fingers, callback)
 
         if #touches ~= fingers then
             if Cache.id and Cache:any(touches) then
-                callback(Cache.id, Swipe.END, 0, 0)
+                callback(Cache.id, Swipe.END, 0, 0, event:timestamp())
                 Cache:clear()
             end
         elseif Cache:none(touches) then
-            callback(Cache:set(touches), Swipe.BEGIN, 0, 0)
+            callback(Cache:set(touches), Swipe.BEGIN, 0, 0, event:timestamp())
         elseif Cache:all(touches) then
             local moved, delta, id = Cache:detect(touches)
             if moved then
-                callback(id, Swipe.MOVED, delta.dx, delta.dy)
+                callback(id, Swipe.MOVED, delta.dx, delta.dy, event:timestamp())
             end
         end
     end)

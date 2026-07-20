@@ -31,6 +31,53 @@ local function scheduleTile(self, space)
     end)
 end
 
+local function tileImmediately(self, space)
+    local pending = pending_layout_timers[space]
+    if pending then
+        pending:stop()
+        pending_layout_timers[space] = nil
+    end
+    self.space.tileSpace(space)
+end
+
+-- A live mouse resize/move emits a flood of AX events. Reflowing the whole
+-- space on each one runs the full tiling pass far faster than the screen can
+-- consume, and starting a per-window animation every event means neighbors
+-- chase the drag with a stream of half-finished transitions. Instead, cap the
+-- reflow to a steady rate and commit frames immediately (no animation) so
+-- neighbors track the drag in lockstep.
+local last_tile_times = {}
+local resize_throttle <const> = 1 / 30
+
+local function tileWithoutAnimation(self, space)
+    local saved = Window.animationDuration
+    Window.animationDuration = 0
+    local ok, err = pcall(self.space.tileSpace, space)
+    Window.animationDuration = saved
+    if not ok then self.logger.ef("tileSpace failed during resize: %s", err) end
+end
+
+local function throttleTile(self, space)
+    local pending = pending_layout_timers[space]
+    if pending then
+        pending:stop()
+        pending_layout_timers[space] = nil
+    end
+
+    local now = Timer.secondsSinceEpoch()
+    local elapsed = now - (last_tile_times[space] or 0)
+    if elapsed >= resize_throttle then
+        last_tile_times[space] = now
+        tileWithoutAnimation(self, space)
+    else
+        pending_layout_timers[space] = Timer.doAfter(resize_throttle - elapsed, function()
+            pending_layout_timers[space] = nil
+            last_tile_times[space] = Timer.secondsSinceEpoch()
+            tileWithoutAnimation(self, space)
+        end)
+    end
+end
+
 ---initialize module with reference to PaperWM
 ---@param paperwm PaperWM
 function Events.init(paperwm)
@@ -65,6 +112,8 @@ function Events.windowEventHandler(window, event, self)
     self.logger.df("%s for [%s] id: %d", event, window:title(), window:id())
     -- hs.printf("%s for [%s] id: %d", event, window, window:id() or -1)
     local space = nil
+    local tile_immediately = false
+    local tile_throttled = false
 
     --[[ When a new window is created, We first get a windowVisible event but
     without a Space. Next we receive a windowFocused event for the window, but
@@ -95,6 +144,7 @@ function Events.windowEventHandler(window, event, self)
         end
         self.state.prev_focused_window = window -- for addWindow()
         space = Spaces.windowSpaces(window)[1]
+        tile_immediately = true
     elseif event == "windowVisible" or event == "windowUnfullscreened" then
         space = self.windows.addWindow(window)
         if self.state.pending_window and window == self.state.pending_window then
@@ -112,7 +162,11 @@ function Events.windowEventHandler(window, event, self)
     elseif event == "windowFullscreened" then -- or event == "windowNotInCurrentSpace" then
         space = self.windows.removeWindow(window, true) -- don't focus new window if fullscreened
     elseif event == "AXWindowMoved" or event == "AXWindowResized" then
-        space = Spaces.windowSpaces(window)[1]
+        -- This runs on every frame of a live drag/resize, so avoid the slow
+        -- private-API space lookup and use the cached space when available.
+        local index = self.state.index_table[window:id()]
+        space = index and index.space or Spaces.windowSpaces(window)[1]
+        tile_throttled = true
     elseif event == "windowsChanged" or event == "windowNotInCurrentSpace" then
         local all_windows = self.windows.PaperWM.window_filter:getWindows()
         local allowed_ids = {}
@@ -153,7 +207,15 @@ function Events.windowEventHandler(window, event, self)
         end
     end
 
-    if space then scheduleTile(self, space) end
+    if space then
+        if tile_throttled then
+            throttleTile(self, space)
+        elseif tile_immediately then
+            tileImmediately(self, space)
+        else
+            scheduleTile(self, space)
+        end
+    end
 end
 
 ---coroutine to slide all windows in a space by dx
@@ -179,7 +241,7 @@ local function slide_windows(self, space, screen_frame)
     local compositor_active = self.windows.beginInteractiveMove(windows)
 
     while true do
-        local dx = coroutine.yield()
+        local dx, input_timestamp = coroutine.yield()
         if not dx then break end
 
         if dx ~= 0 then
@@ -188,7 +250,7 @@ local function slide_windows(self, space, screen_frame)
                 item.frame.x = dx > 0 and math.min(item.x, right_margin) or math.max(item.x, left_margin - item.frame.w)
             end
             if compositor_active then
-                compositor_active = self.windows.updateInteractiveMove(windows)
+                compositor_active = self.windows.updateInteractiveMove(windows, input_timestamp)
             else
                 for _, item in ipairs(windows) do
                     item.window:setTopLeft(item.frame.x, item.frame.y)
@@ -237,14 +299,14 @@ end
 ---@param self PaperWM
 function Events.swipeHandler(self)
     -- saved upvalues between callback function calls
-    local swipe_coro, screen_frame = nil, nil
+    local swipe_coro, screen_frame, horizontal = nil, nil, nil
 
     ---callback for touchpad swipe gesture event
     ---@param id number unique id across callbacks for the same swipe
     ---@param type number one of Swipe.BEGIN, Swipe.MOVED, Swipe.END
     ---@param dx number change in horizonal position since last callback: between 0 and 1
     ---@param dy number change in vertical position since last callback: between 0 and 1
-    return function(id, type, dx, dy)
+    return function(id, type, dx, dy, input_timestamp)
         if type == Events.Swipe.BEGIN then
 
             -- use focused window for space to scroll windows
@@ -268,6 +330,7 @@ function Events.swipeHandler(self)
 
             -- cache upvalues
             screen_frame = screen:frame()
+            horizontal = nil
             swipe_coro = coroutine.wrap(slide_windows)
             swipe_coro(self, focused_index.space, screen_frame)
         elseif swipe_coro and type == Events.Swipe.END then
@@ -275,9 +338,12 @@ function Events.swipeHandler(self)
             swipe_coro(nil)
             swipe_coro = nil
         elseif swipe_coro and screen_frame and type == Events.Swipe.MOVED then
-            if math.abs(dy) >= math.abs(dx) then return end -- horizontal swipes only
-            dx = math.floor(self.swipe_gain * dx * screen_frame.w)
-            swipe_coro(dx)
+            if horizontal == nil and (dx ~= 0 or dy ~= 0) then
+                horizontal = math.abs(dx) > math.abs(dy)
+            end
+            if not horizontal then return end
+            dx = self.swipe_gain * dx * screen_frame.w
+            swipe_coro(dx, input_timestamp)
         end
     end
 end
@@ -341,14 +407,15 @@ function Events.mouseHandler(self)
             end
         elseif type == LeftMouseDragged then
             if drag_coro then
-                drag_coro(event:getProperty(MouseEventDeltaX))
+                drag_coro(event:getProperty(MouseEventDeltaX), event:timestamp())
                 delete_event = true
             elseif lift_window then
                 local frame = lift_items[1].frame
                 frame.x = frame.x + event:getProperty(MouseEventDeltaX)
                 frame.y = frame.y + event:getProperty(MouseEventDeltaY)
                 if lift_compositor then
-                    lift_compositor = self.windows.updateInteractiveMove(lift_items)
+                    lift_compositor = self.windows.updateInteractiveMove(
+                        lift_items, event:timestamp())
                 else
                     lift_window:setTopLeft(frame.x, frame.y)
                 end
@@ -412,6 +479,7 @@ function Events.stop()
         timer:stop()
         pending_layout_timers[space] = nil
     end
+    last_tile_times = {}
 
     -- stop listening for touchpad swipes
     Events.Swipe:stop()

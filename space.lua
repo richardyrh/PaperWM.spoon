@@ -39,10 +39,14 @@ function Space.tileSpace(space)
         return
     end
 
-    -- if focused window is in space, tile from that
+    -- if focused window is in space, tile from that. Use the cached index
+    -- rather than Spaces.windowSpaces (a slow private-API call) because
+    -- tileSpace runs on every throttled frame of a live drag/resize.
     local focused_window = Window.focusedWindow()
     local anchor_window = (function()
-        if focused_window and not Space.PaperWM.state.is_floating[focused_window:id()] and Spaces.windowSpaces(focused_window)[1] == space then
+        local focused_index = focused_window and Space.PaperWM.state.index_table[focused_window:id()]
+        if focused_window and not Space.PaperWM.state.is_floating[focused_window:id()] and
+            focused_index and focused_index.space == space then
             return focused_window
         else
             return Space.PaperWM.windows.getFirstVisibleWindow(space, screen:frame())

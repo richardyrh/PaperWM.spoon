@@ -127,6 +127,8 @@ local native_transform_error = nil
 local native_animations = {}
 local native_animation_timer = nil
 local interactive_moves = nil
+local interactive_profile = nil
+local last_interactive_profile = nil
 
 local function loadNativeTransform()
     if native_transform_checked then return native_transform end
@@ -334,6 +336,23 @@ local function finishInteractiveMove(set_real_positions)
     if updates_disabled then nativeCall("endUpdates") end
     interactive_moves = nil
 
+    if interactive_profile and interactive_profile.samples > 0 then
+        interactive_profile.average_input_age_ms =
+            interactive_profile.total_input_age_ms / interactive_profile.samples
+        interactive_profile.average_skylight_ms =
+            interactive_profile.total_skylight_ms / interactive_profile.samples
+        last_interactive_profile = interactive_profile
+        if Windows.PaperWM then
+            Windows.PaperWM.logger.df(
+                "interactive latency: input %.2f ms avg/%.2f max, SkyLight %.2f ms avg/%.2f max",
+                interactive_profile.average_input_age_ms,
+                interactive_profile.max_input_age_ms,
+                interactive_profile.average_skylight_ms,
+                interactive_profile.max_skylight_ms)
+        end
+    end
+    interactive_profile = nil
+
     if not reset_ok and Windows.PaperWM then
         Windows.PaperWM.logger.ef(
             "could not reset interactive native transforms: %s", reset_error)
@@ -412,6 +431,12 @@ function Windows.nativeAnimationStatus()
     return false, native_transform_error
 end
 
+---return timing from the most recently completed compositor gesture
+---@return table|nil
+function Windows.interactiveLatencyStatus()
+    return last_interactive_profile
+end
+
 ---begin a compositor-backed interactive position gesture
 ---@param items table[] tables containing a window and its current frame
 ---@return boolean
@@ -422,6 +447,13 @@ function Windows.beginInteractiveMove(items)
     stopAllNativeAnimations(true)
     stopAllPositionAnimations(true)
     interactive_moves = {}
+    interactive_profile = {
+        samples = 0,
+        total_input_age_ms = 0,
+        max_input_age_ms = 0,
+        total_skylight_ms = 0,
+        max_skylight_ms = 0,
+    }
 
     for _, item in ipairs(items) do
         local id = item.window:id()
@@ -442,8 +474,9 @@ end
 
 ---apply one batched compositor update during an interactive gesture
 ---@param items table[] tables containing a window and desired frame
+---@param input_timestamp number|nil event timestamp in absolute nanoseconds
 ---@return boolean
-function Windows.updateInteractiveMove(items)
+function Windows.updateInteractiveMove(items, input_timestamp)
     if not interactive_moves then return false end
 
     local transforms = {}
@@ -462,7 +495,22 @@ function Windows.updateInteractiveMove(items)
         end
     end
 
+    local call_started = Timer.absoluteTime()
+    local input_age_ms = input_timestamp and input_timestamp > 0 and
+        math.max(0, (call_started - input_timestamp) / 1000000) or 0
     local transformed, reason = nativeCall("set", transforms)
+    local skylight_ms = (Timer.absoluteTime() - call_started) / 1000000
+    if interactive_profile then
+        interactive_profile.samples = interactive_profile.samples + 1
+        interactive_profile.total_input_age_ms =
+            interactive_profile.total_input_age_ms + input_age_ms
+        interactive_profile.max_input_age_ms =
+            math.max(interactive_profile.max_input_age_ms, input_age_ms)
+        interactive_profile.total_skylight_ms =
+            interactive_profile.total_skylight_ms + skylight_ms
+        interactive_profile.max_skylight_ms =
+            math.max(interactive_profile.max_skylight_ms, skylight_ms)
+    end
     if transformed then return true end
 
     native_transform_error = reason
