@@ -65,6 +65,14 @@ Config.window_ratios = { 0.23607, 0.38195, 0.61804 } ---@type number[]
 ---the native backend automatically falls back when its SkyLight helper is unavailable
 Config.animation_backend = "native" ---@type "accessibility"|"native"
 
+---CSS-style cubic Bezier timing curve: { x1, y1, x2, y2 }
+---x values must be between 0 and 1; y values may extend beyond that range
+Config.animation_curve = { 0.2, 0.0, 0.0, 1.0 } ---@type number[]
+
+---maximum time in seconds for an Accessibility window request
+---this protects Hammerspoon when an owning application is unresponsive
+Config.ax_timeout = 0.2 ---@type number
+
 ---size of the on-screen margin to place off-screen windows
 Config.screen_margin = 1 ---@type number
 

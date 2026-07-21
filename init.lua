@@ -93,6 +93,11 @@ function PaperWM:start()
             "please check 'Displays have separate Spaces' in System Preferences -> Mission Control")
     end
 
+    -- hs.window calls are synchronous AX requests. Bound the few operations
+    -- that remain in the native path so a hung application cannot indefinitely
+    -- stall Hammerspoon's main thread.
+    Window.timeout(self.ax_timeout)
+
     -- clear state
     self.state.window_list = {}
     self.state.index_table = {}
@@ -122,7 +127,7 @@ end
 ---stop automatic window tiling
 ---@return PaperWM
 function PaperWM:stop()
-    self.windows.stopAnimations()
+    self.windows.stopAnimations(true)
     self.space.stop()
 
     -- stop events
@@ -132,6 +137,8 @@ function PaperWM:stop()
     for _, window in ipairs(self.window_filter:getWindows()) do
         window:setFrameInScreenBounds()
     end
+
+    Window.timeout(0)
 
     return self
 end

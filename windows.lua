@@ -22,10 +22,93 @@ local position_animation_timer = nil
 local move_generations = {}
 local animation_interval <const> = 1 / 60
 local watcher_restart_padding <const> = 0.02
+local default_animation_curve <const> = { 0.2, 0.0, 0.0, 1.0 }
+local cached_curve = {}
+local cached_curve_coefficients = nil
+
+local function curveControlPoints()
+    local curve = Windows.PaperWM and Windows.PaperWM.animation_curve or
+        default_animation_curve
+    local x1 = curve and (curve.x1 or curve[1])
+    local y1 = curve and (curve.y1 or curve[2])
+    local x2 = curve and (curve.x2 or curve[3])
+    local y2 = curve and (curve.y2 or curve[4])
+
+    if type(x1) ~= "number" or type(y1) ~= "number" or
+        type(x2) ~= "number" or type(y2) ~= "number" or
+        x1 ~= x1 or y1 ~= y1 or x2 ~= x2 or y2 ~= y2 or
+        math.abs(x1) == math.huge or math.abs(y1) == math.huge or
+        math.abs(x2) == math.huge or math.abs(y2) == math.huge or
+        x1 < 0 or x1 > 1 or x2 < 0 or x2 > 1 then
+        return table.unpack(default_animation_curve)
+    end
+    return x1, y1, x2, y2
+end
+
+local function curveCoefficients()
+    local x1, y1, x2, y2 = curveControlPoints()
+    if not cached_curve_coefficients or cached_curve[1] ~= x1 or
+        cached_curve[2] ~= y1 or cached_curve[3] ~= x2 or cached_curve[4] ~= y2 then
+        cached_curve = { x1, y1, x2, y2 }
+        local cx, cy = 3 * x1, 3 * y1
+        local bx, by = (3 * x2) - (2 * cx), (3 * y2) - (2 * cy)
+        cached_curve_coefficients = {
+            ax = 1 - cx - bx,
+            bx = bx,
+            cx = cx,
+            ay = 1 - cy - by,
+            by = by,
+            cy = cy,
+        }
+    end
+    return cached_curve_coefficients
+end
+
+
+local function sampleCurve(a, b, c, t)
+    return ((a * t + b) * t + c) * t
+end
+
+local function sampleCurveDerivative(a, b, c, t)
+    return (3 * a * t * t) + (2 * b * t) + c
+end
 
 local function easeProgress(progress)
-    -- Keep the soft cubic landing, but add a short, mild acceleration ramp.
-    return 1 - ((1 - (progress ^ 1.15)) ^ 3)
+    if progress <= 0 then return 0 end
+    if progress >= 1 then return 1 end
+
+    local coefficients = curveCoefficients()
+    local t = progress
+
+    -- Invert the curve's x coordinate so animation time maps to y. Newton's
+    -- method handles the common case; bisection covers flat control points.
+    for _ = 1, 5 do
+        local error = sampleCurve(coefficients.ax, coefficients.bx,
+            coefficients.cx, t) - progress
+        if math.abs(error) < 0.00001 then break end
+        local slope = sampleCurveDerivative(coefficients.ax, coefficients.bx,
+            coefficients.cx, t)
+        if math.abs(slope) < 0.000001 then break end
+        local next_t = t - (error / slope)
+        if next_t < 0 or next_t > 1 then break end
+        t = next_t
+    end
+
+    if math.abs(sampleCurve(coefficients.ax, coefficients.bx,
+            coefficients.cx, t) - progress) >= 0.00001 then
+        local low, high = 0, 1
+        for _ = 1, 12 do
+            t = (low + high) / 2
+            if sampleCurve(coefficients.ax, coefficients.bx,
+                    coefficients.cx, t) < progress then
+                low = t
+            else
+                high = t
+            end
+        end
+    end
+
+    return sampleCurve(coefficients.ay, coefficients.by, coefficients.cy, t)
 end
 
 local function watcherEvents()
@@ -119,14 +202,16 @@ local function animatePosition(window, start_frame, end_frame, watcher, generati
 end
 
 -- Optional compositor backend. The helper applies private SkyLight
--- presentation transforms; real Accessibility positions are committed only
--- once, under a short WindowServer update lock, when the animation finishes.
+-- presentation transforms and position commits. Accessibility is used only
+-- for a size change, outside the short WindowServer update lock.
 local native_transform = nil
 local native_transform_checked = false
 local native_transform_error = nil
 local native_animations = {}
 local native_animation_timer = nil
 local interactive_moves = nil
+local quarantined_windows = {}
+local quarantine_timer = nil
 local interactive_profile = nil
 local last_interactive_profile = nil
 
@@ -169,7 +254,30 @@ local function nativeCall(method, ...)
     local called, result, reason = pcall(transform[method], ...)
     if not called then return false, result end
     if not result then return false, reason end
-    return true
+    return true, result
+end
+
+local function nativeBounds(id)
+    local ok, bounds = nativeCall("bounds", { id })
+    if not ok or not bounds or not bounds[1] then return nil, bounds end
+    local frame = bounds[1]
+    return hs.geometry.rect(frame.x, frame.y, frame.w, frame.h)
+end
+
+local function sizesMatch(a, b)
+    return a and math.abs(a.w - b.w) <= 1 and math.abs(a.h - b.h) <= 1
+end
+
+local function targetTransform(record, real_frame)
+    local sx = record.end_frame.w / real_frame.w
+    local sy = record.end_frame.h / real_frame.h
+    return {
+        id = record.id,
+        sx = sx,
+        sy = sy,
+        tx = record.end_frame.x - (real_frame.x * sx),
+        ty = record.end_frame.y - (real_frame.y * sy),
+    }
 end
 
 local function identityTransforms(records)
@@ -180,26 +288,132 @@ local function identityTransforms(records)
     return transforms
 end
 
+
+local function settleNativeRecord(record, real_frame)
+    local updates_disabled = nativeCall("beginUpdates")
+    local moved, move_error = nativeCall("move", {
+        { id = record.id, x = record.end_frame.x, y = record.end_frame.y },
+    })
+    local reset_ok, reset_error = false, nil
+    if moved then
+        reset_ok, reset_error = nativeCall("set", identityTransforms({ record }))
+    end
+    if updates_disabled then nativeCall("endUpdates") end
+
+    if moved and reset_ok then return true end
+
+    -- If the native move failed, preserve the destination visually. If the
+    -- identity reset failed, the existing target transform is still in place.
+    if not moved and real_frame and real_frame.w > 0 and real_frame.h > 0 then
+        nativeCall("set", { targetTransform(record, real_frame) })
+    end
+    return false, move_error or reset_error
+end
+
+local retryQuarantinedWindow
+
+local function ensureQuarantineTimer()
+    if quarantine_timer then return end
+    quarantine_timer = Timer.new(0.25, function()
+        local now = Timer.secondsSinceEpoch()
+        for _, record in pairs(quarantined_windows) do
+            if now >= record.next_retry then
+                retryQuarantinedWindow(record)
+                break -- at most one bounded AX request per tick
+            end
+        end
+        if not next(quarantined_windows) and quarantine_timer then
+            quarantine_timer:stop()
+            quarantine_timer = nil
+        end
+    end)
+    quarantine_timer:start()
+end
+
+local function quarantineWindow(record, real_frame, reason)
+    record.real_frame = real_frame or record.real_frame
+    record.retry_delay = math.min((record.retry_delay or 0.5) * 2, 8)
+    record.next_retry = Timer.secondsSinceEpoch() + record.retry_delay
+    quarantined_windows[record.id] = record
+    if record.real_frame and record.real_frame.w > 0 and record.real_frame.h > 0 then
+        nativeCall("set", { targetTransform(record, record.real_frame) })
+    end
+    ensureQuarantineTimer()
+    if Windows.PaperWM then
+        Windows.PaperWM.logger.wf(
+            "window %d resize deferred; retaining compositor transform: %s",
+            record.id, tostring(reason or "Accessibility size did not converge"))
+    end
+end
+
+local function commitNativeRecord(record)
+    local real_frame, bounds_error = nativeBounds(record.id)
+    if not real_frame then
+        record.missing_count = (record.missing_count or 0) + 1
+        if record.missing_count >= 3 then
+            nativeCall("set", identityTransforms({ record }))
+            quarantined_windows[record.id] = nil
+            return true
+        end
+        quarantineWindow(record, record.real_frame, bounds_error)
+        return false
+    end
+    record.missing_count = 0
+    if real_frame.w <= 0 or real_frame.h <= 0 then
+        quarantineWindow(record, real_frame, "WindowServer reported empty bounds")
+        return false
+    end
+
+    nativeCall("set", { targetTransform(record, real_frame) })
+    if not sizesMatch(real_frame, record.end_frame) then
+        -- This is deliberately the only AX operation in the native commit path.
+        -- hs.window.timeout bounds how long an unresponsive app can hold us here.
+        local resized, resize_error = pcall(record.window.setSize, record.window,
+            record.end_frame.w, record.end_frame.h)
+        local resized_frame = nativeBounds(record.id)
+        if resized_frame then real_frame = resized_frame end
+        if not resized or not sizesMatch(real_frame, record.end_frame) then
+            quarantineWindow(record, real_frame, resize_error)
+            return false
+        end
+    end
+
+    local settled, settle_error = settleNativeRecord(record, real_frame)
+    if not settled then
+        quarantineWindow(record, real_frame, settle_error)
+        return false
+    end
+    quarantined_windows[record.id] = nil
+    return true
+end
+
+retryQuarantinedWindow = function(record)
+    if quarantined_windows[record.id] ~= record then return end
+    if commitNativeRecord(record) then
+        restartWatcherAfter(watcher_restart_padding, record.id,
+            record.watcher, record.generation)
+    end
+end
+
 local function commitNativeAnimations(records, set_real_positions)
     if #records == 0 then return end
 
-    local updates_disabled = nativeCall("beginUpdates")
-    if set_real_positions then
-        for _, animation in ipairs(records) do
-            pcall(animation.window.setFrame, animation.window, animation.end_frame, 0)
-        end
-    end
-    local reset_ok, reset_error = nativeCall("set", identityTransforms(records))
-    if updates_disabled then nativeCall("endUpdates") end
-
-    if not reset_ok and Windows.PaperWM then
-        Windows.PaperWM.logger.ef("could not reset native transforms: %s", reset_error)
-    end
-
     for _, animation in ipairs(records) do
         native_animations[animation.id] = nil
-        restartWatcherAfter(watcher_restart_padding, animation.id,
-            animation.watcher, animation.generation)
+        if set_real_positions then
+            if commitNativeRecord(animation) then
+                restartWatcherAfter(watcher_restart_padding, animation.id,
+                    animation.watcher, animation.generation)
+            end
+        else
+            local reset_ok, reset_error = nativeCall("set", identityTransforms({ animation }))
+            if not reset_ok and Windows.PaperWM then
+                Windows.PaperWM.logger.ef(
+                    "could not reset native transform: %s", reset_error)
+            end
+            restartWatcherAfter(watcher_restart_padding, animation.id,
+                animation.watcher, animation.generation)
+        end
     end
 end
 
@@ -280,10 +494,16 @@ end
 local function animateNativeFrame(window, real_frame, end_frame, watcher, generation)
     local id = window:id()
     local previous = native_animations[id]
-    local start_x = previous and previous.x or real_frame.x
-    local start_y = previous and previous.y or real_frame.y
-    local start_sx = previous and previous.sx or 1
-    local start_sy = previous and previous.sy or 1
+    local quarantined = quarantined_windows[id]
+    local start_x = previous and previous.x or
+        (quarantined and quarantined.end_frame.x or real_frame.x)
+    local start_y = previous and previous.y or
+        (quarantined and quarantined.end_frame.y or real_frame.y)
+    local start_sx = previous and previous.sx or
+        (quarantined and quarantined.end_frame.w / real_frame.w or 1)
+    local start_sy = previous and previous.sy or
+        (quarantined and quarantined.end_frame.h / real_frame.h or 1)
+    quarantined_windows[id] = nil
 
     native_animations[id] = {
         id = id,
@@ -326,15 +546,31 @@ local function finishInteractiveMove(set_real_positions)
     for _, record in pairs(interactive_moves) do table.insert(records, record) end
 
     local updates_disabled = nativeCall("beginUpdates")
+    local moved, move_error = true, nil
     if set_real_positions then
+        local moves = {}
         for _, record in ipairs(records) do
-            pcall(record.window.setTopLeft, record.window,
-                record.end_frame.x, record.end_frame.y)
+            table.insert(moves, {
+                id = record.id,
+                x = record.end_frame.x,
+                y = record.end_frame.y,
+            })
         end
+        moved, move_error = nativeCall("move", moves)
     end
-    local reset_ok, reset_error = nativeCall("set", identityTransforms(records))
+    local reset_ok, reset_error = false, nil
+    if moved or not set_real_positions then
+        reset_ok, reset_error = nativeCall("set", identityTransforms(records))
+    end
     if updates_disabled then nativeCall("endUpdates") end
     interactive_moves = nil
+
+    if set_real_positions and (not moved or not reset_ok) then
+        for _, record in ipairs(records) do
+            quarantineWindow(record, nativeBounds(record.id) or record.real_frame,
+                move_error or reset_error)
+        end
+    end
 
     if interactive_profile and interactive_profile.samples > 0 then
         interactive_profile.average_input_age_ms =
@@ -353,15 +589,32 @@ local function finishInteractiveMove(set_real_positions)
     end
     interactive_profile = nil
 
-    if not reset_ok and Windows.PaperWM then
+    if (not moved or not reset_ok) and Windows.PaperWM then
         Windows.PaperWM.logger.ef(
-            "could not reset interactive native transforms: %s", reset_error)
+            "could not commit interactive native move: %s",
+            tostring(move_error or reset_error))
+    end
+end
+
+local function clearQuarantinedWindows()
+    local records = {}
+    for _, record in pairs(quarantined_windows) do table.insert(records, record) end
+    if #records > 0 then nativeCall("set", identityTransforms(records)) end
+    for id, record in pairs(quarantined_windows) do
+        quarantined_windows[id] = nil
+        restartWatcherAfter(watcher_restart_padding, id,
+            record.watcher, record.generation)
+    end
+    if quarantine_timer then
+        quarantine_timer:stop()
+        quarantine_timer = nil
     end
 end
 
 _G.PaperWMNativeAnimationCleanup = function()
     stopAllNativeAnimations(true)
     finishInteractiveMove(true)
+    clearQuarantinedWindows()
 end
 
 ---@enum Direction
@@ -383,6 +636,13 @@ Windows.Direction = Direction
 ---@param paperwm PaperWM
 function Windows.init(paperwm)
     Windows.PaperWM = paperwm
+end
+
+---sample the currently configured animation timing curve
+---@param progress number value from 0 to 1
+---@return number
+function Windows.sampleAnimationCurve(progress)
+    return easeProgress(math.max(0, math.min(1, progress)))
 end
 
 ---return the first window that's completely on the screen
@@ -418,8 +678,9 @@ end
 function Windows.getWindowFrame(window)
     local id = window:id()
     local animation = native_animations[id] or position_animations[id] or
-        (interactive_moves and interactive_moves[id])
-    local frame = animation and animation.end_frame or window:frame()
+        (interactive_moves and interactive_moves[id]) or quarantined_windows[id]
+    local frame = animation and animation.end_frame or
+        (nativeBackendEnabled() and nativeBounds(id)) or window:frame()
     return hs.geometry.rect(frame.x, frame.y, frame.w, frame.h)
 end
 
@@ -460,11 +721,13 @@ function Windows.beginInteractiveMove(items)
         -- Invalidate any delayed watcher restart left by an interrupted
         -- animation; the gesture owner restarts its watchers when it ends.
         move_generations[id] = (move_generations[id] or 0) + 1
-        local frame = item.window:frame()
+        local frame = nativeBounds(id) or item.window:frame()
         item.frame = hs.geometry.rect(frame.x, frame.y, frame.w, frame.h)
         interactive_moves[id] = {
             id = id,
             window = item.window,
+            watcher = Windows.PaperWM.state.ui_watchers[id],
+            generation = move_generations[id],
             real_frame = frame,
             end_frame = hs.geometry.rect(frame.x, frame.y, frame.w, frame.h),
         }
@@ -729,9 +992,9 @@ function Windows.addWindow(add_window)
         add_column = Windows.PaperWM.state.index_table[Windows.PaperWM.state.prev_focused_window:id()].col +
             1 -- insert to the right
     else
-        local x = add_window:frame().center.x
+        local x = Windows.getWindowFrame(add_window).center.x
         for col, windows in ipairs(Windows.PaperWM.state.window_list[space]) do
-            if x < windows[1]:frame().center.x then
+            if x < Windows.getWindowFrame(windows[1]).center.x then
                 add_column = col     -- insert left of window
                 break                -- add_window will take this window's column
             else                     -- everything after insert column will be pushed right
@@ -1003,8 +1266,8 @@ function Windows.swapWindows(direction)
         end
 
         -- swap frames
-        local focused_frame = focused_window:frame()
-        local target_frame = target_column[1]:frame()
+        local focused_frame = Windows.getWindowFrame(focused_window)
+        local target_frame = Windows.getWindowFrame(target_column[1])
         local right_gap = Windows.getGap("right")
         local left_gap = Windows.getGap("left")
         if direction == Direction.LEFT then
@@ -1015,12 +1278,12 @@ function Windows.swapWindows(direction)
             focused_frame.x = target_frame.x2 + right_gap
         end
         for _, window in ipairs(target_column) do
-            local frame = window:frame()
+            local frame = Windows.getWindowFrame(window)
             frame.x = target_frame.x
             Windows.moveWindow(window, frame)
         end
         for _, window in ipairs(focused_column) do
-            local frame = window:frame()
+            local frame = Windows.getWindowFrame(window)
             frame.x = focused_frame.x
             Windows.moveWindow(window, frame)
         end
@@ -1049,8 +1312,8 @@ function Windows.swapWindows(direction)
         Windows.PaperWM.state.index_table[focused_window:id()] = target_index
 
         -- swap frames
-        local focused_frame = focused_window:frame()
-        local target_frame = target_window:frame()
+        local focused_frame = Windows.getWindowFrame(focused_window)
+        local target_frame = Windows.getWindowFrame(target_window)
         local bottom_gap = Windows.getGap("bottom")
         if direction == Direction.UP then
             focused_frame.y = target_frame.y
@@ -1098,14 +1361,14 @@ function Windows.swapColumns(direction)
     Windows.PaperWM.state.window_list[focused_index.space][adjacent_column_index] = focused_column
     Windows.PaperWM.state.window_list[focused_index.space][focused_index.col] = adjacent_column
 
-    local focused_frame = focused_window:frame()
+    local focused_frame = Windows.getWindowFrame(focused_window)
     local adjacent_window = adjacent_column[1]
     if not adjacent_window then
         Windows.PaperWM.logger.e("adjacent window not found")
         return
     end
 
-    local adjacent_frame = adjacent_window:frame()
+    local adjacent_frame = Windows.getWindowFrame(adjacent_window)
     local focused_x = focused_frame.x
     local adjacent_x = adjacent_frame.x
 
@@ -1130,12 +1393,12 @@ function Windows.swapColumns(direction)
 
     -- update window positions
     for row, window in ipairs(adjacent_column) do
-        local frame = window:frame()
+        local frame = Windows.getWindowFrame(window)
         Windows.moveWindow(window, Rect(focused_x, frame.y, frame.w, frame.h))
     end
 
     for row, window in ipairs(focused_column) do
-        local frame = window:frame()
+        local frame = Windows.getWindowFrame(window)
         Windows.moveWindow(window, Rect(adjacent_x, frame.y, frame.w, frame.h))
     end
 
@@ -1154,7 +1417,7 @@ function Windows.centerWindow()
     end
 
     -- get global coordinates
-    local focused_frame = focused_window:frame()
+    local focused_frame = Windows.getWindowFrame(focused_window)
     local screen_frame = focused_window:screen():frame()
 
     -- center window
@@ -1180,7 +1443,7 @@ function Windows.toggleWindowFullWidth()
         end
 
         local canvas = Windows.getCanvas(focused_window:screen())
-        local focused_frame = focused_window:frame()
+        local focused_frame = Windows.getWindowFrame(focused_window)
         local id = focused_window:id()
 
         local width = width_cache[id]
@@ -1261,7 +1524,7 @@ function Windows.cycleWindowSize(direction, cycle_direction)
     end
 
     local canvas = Windows.getCanvas(focused_window:screen())
-    local focused_frame = focused_window:frame()
+    local focused_frame = Windows.getWindowFrame(focused_window)
 
     if direction == Direction.WIDTH then
         local new_width = findNewSize(canvas.w, focused_frame.w, cycle_direction, Direction.WIDTH)
@@ -1300,7 +1563,7 @@ function Windows.increaseWindowSize(direction, scale)
     end
 
     local canvas = Windows.getCanvas(focused_window:screen())
-    local focused_frame = focused_window:frame()
+    local focused_frame = Windows.getWindowFrame(focused_window)
 
     if direction == Direction.WIDTH then
         local diff = canvas.w * 0.1 * scale
@@ -1377,7 +1640,7 @@ function Windows.slurpWindow()
     local canvas = Windows.getCanvas(focused_window:screen())
     local bottom_gap = Windows.getGap("bottom")
     local bounds = {
-        x = column[1]:frame().x,
+        x = Windows.getWindowFrame(column[1]).x,
         x2 = nil,
         y = canvas.y,
         y2 = canvas.y2,
@@ -1429,7 +1692,7 @@ function Windows.barfWindow()
     -- adjust window frames
     local num_windows = #column
     local canvas = Windows.getCanvas(focused_window:screen())
-    local focused_frame = focused_window:frame()
+    local focused_frame = Windows.getWindowFrame(focused_window)
     local bottom_gap = Windows.getGap("bottom")
     local right_gap = Windows.getGap("right")
 
@@ -1468,7 +1731,7 @@ function Windows.moveWindow(window, frame)
     local generation = (move_generations[id] or 0) + 1
     move_generations[id] = generation
 
-    local current_frame = window:frame()
+    local current_frame = nativeBackendEnabled() and nativeBounds(id) or window:frame()
     local can_transform = current_frame.w > 0 and current_frame.h > 0
 
     if can_transform and Window.animationDuration > 0 and nativeBackendEnabled() then
@@ -1499,10 +1762,11 @@ function Windows.moveWindow(window, frame)
 end
 
 ---finish active presentation transforms and restore real window frames
-function Windows.stopAnimations()
+function Windows.stopAnimations(clear_quarantine)
     finishInteractiveMove(true)
     stopAllNativeAnimations(true)
     stopAllPositionAnimations(true)
+    if clear_quarantine then clearQuarantinedWindows() end
 end
 
 ---add or remove focused window from the floating layer and retile the space

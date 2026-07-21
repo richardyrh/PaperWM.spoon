@@ -109,7 +109,9 @@ function Events.windowEventHandler(window, event, self)
         return
     end
 
-    self.logger.df("%s for [%s] id: %d", event, window:title(), window:id())
+    -- Avoid synchronously asking the owning application for its title in the
+    -- hot event path; a hung app can otherwise delay every window event.
+    self.logger.df("%s for window id: %d", event, window:id())
     -- hs.printf("%s for [%s] id: %d", event, window, window:id() or -1)
     local space = nil
     local tile_immediately = false
@@ -234,7 +236,7 @@ local function slide_windows(self, space, screen_frame)
         if window then
             local watcher = self.state.ui_watchers[id]
             if watcher then watcher:stop() end
-            local frame = window:frame()
+            local frame = self.windows.getWindowFrame(window)
             table.insert(windows, { window = window, frame = frame, x = x })
         end
     end
@@ -271,7 +273,7 @@ local function slide_windows(self, space, screen_frame)
     -- ensure a focused window is on screen
     local focused_window = Window.focusedWindow()
     if focused_window then
-        local frame = focused_window:frame()
+        local frame = self.windows.getWindowFrame(focused_window)
         local visible_window = (function()
             if frame.x < screen_frame.x then
                 return self.windows.getFirstVisibleWindow(space, screen_frame,
@@ -364,7 +366,9 @@ function Events.mouseHandler(self)
         if not space then return end
         for id, _ in pairs(self.state.x_positions[space] or {}) do
             local window = Window(id)
-            if window and cursor:inside(window:frame()) then return window end
+            if window and cursor:inside(self.windows.getWindowFrame(window)) then
+                return window
+            end
         end
     end
 
@@ -399,7 +403,10 @@ function Events.mouseHandler(self)
                 lift_window = windowUnderCursor(event)
                 if lift_window then
                     self.windows.toggleFloating(lift_window)
-                    lift_items = { { window = lift_window, frame = lift_window:frame() } }
+                    lift_items = {
+                        { window = lift_window,
+                          frame = self.windows.getWindowFrame(lift_window) },
+                    }
                     lift_compositor = self.windows.beginInteractiveMove(lift_items)
                 end
                 self.logger.df("lift window start for: %s", lift_window)

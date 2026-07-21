@@ -181,10 +181,32 @@ make -C ~/.hammerspoon/Spoons/PaperWM.spoon/native
 
 ```lua
 PaperWM.animation_backend = "native" -- default for this experimental build
+
+-- CSS-style cubic-bezier(x1, y1, x2, y2)
+PaperWM.animation_curve = { 0.2, 0.0, 0.0, 1.0 }
+
+-- Bound synchronous AX calls when an application is hung (seconds).
+PaperWM.ax_timeout = 0.2
 ```
 
-Use `"accessibility"` to select the standard path. If the helper cannot load or
-SkyLight rejects a transform, PaperWM falls back to Accessibility animation.
+The curve can be changed on the active Spoon at runtime, so experimenting in
+the Hammerspoon Console does not require a reload. The x control points must be
+between `0` and `1`; y values outside that range are allowed for overshoot:
+
+```lua
+PaperWM.animation_curve = { 0.25, 0.1, 0.25, 1.0 } -- CSS "ease"
+PaperWM.animation_curve = { x1 = 0.34, y1 = 1.56, x2 = 0.64, y2 = 1.0 }
+PaperWM.windows.sampleAnimationCurve(0.5) -- inspect the curve at 50% time
+```
+
+Use `"accessibility"` to select the standard path. The native path reads real
+window bounds from public WindowServer metadata and commits position changes
+directly. Resizes still require Accessibility; they use `ax_timeout`, and a
+window that does not respond keeps its compositor presentation while PaperWM
+retries with backoff. `hs.window.timeout` is process-wide, so `ax_timeout`
+also bounds other Hammerspoon window Accessibility calls while PaperWM runs.
+If the helper cannot load or SkyLight rejects a transform, PaperWM falls back
+to Accessibility animation.
 
 Configure the `PaperWM.window_filter` to set which apps and screens are managed.
 For example:
