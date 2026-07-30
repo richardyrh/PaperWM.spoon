@@ -82,6 +82,27 @@ Config.swipe_fingers = 0 ---@type number
 ---increase this number to make windows move futher when swiping
 Config.swipe_gain = 1 ---@type number
 
+---distance in pixels between trackpad haptic ticks while swiping, set to 0 to disable
+Config.swipe_haptic_interval = 120 ---@type number
+
+---idle time in seconds before normalizing layout after a swipe
+Config.swipe_settle_delay = 0.25 ---@type number
+
+---continue native swipe movement with release velocity
+Config.swipe_inertia = true ---@type boolean
+
+---exponential velocity decay per second; lower values coast farther
+Config.swipe_inertia_friction = 3.5 ---@type number
+
+---minimum release velocity in pixels per second needed to coast
+Config.swipe_inertia_min_velocity = 40 ---@type number
+
+---maximum release velocity in pixels per second
+Config.swipe_inertia_max_velocity = 6000 ---@type number
+
+---write detailed gesture timing to /tmp/paperwm_swipe_trace.log
+Config.swipe_debug_trace = false ---@type boolean
+
 ---center mouse cursor on screen after switching spaces
 Config.center_mouse = true ---@type boolean
 

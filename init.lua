@@ -117,6 +117,10 @@ function PaperWM:start()
 
     -- populate window list, index table, ui_watchers, and set initial layout
     self.windows.refreshWindows()
+    -- Do not expose gesture listeners while initial presentation animations
+    -- are still in flight; the first swipe would otherwise interrupt their
+    -- per-window commit path and inherit inconsistent transform baselines.
+    self.windows.stopAnimations(true)
 
     -- start event listeners
     self.events.start()

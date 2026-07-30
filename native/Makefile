@@ -1,7 +1,7 @@
 HAMMERSPOON_APP ?= /Applications/Hammerspoon.app
 LUA_HEADERS := $(HAMMERSPOON_APP)/Contents/Frameworks/LuaSkin.framework/Headers
 TARGET := paperwm_transform.so
-SOURCE := paperwm_transform.c
+SOURCE := paperwm_transform.m
 
 .PHONY: all clean
 
@@ -12,6 +12,7 @@ $(TARGET): $(SOURCE)
 		-bundle -undefined dynamic_lookup \
 		-I"$(LUA_HEADERS)" \
 		-framework ApplicationServices \
+		-framework AppKit \
 		-o "$@" "$<"
 
 clean:

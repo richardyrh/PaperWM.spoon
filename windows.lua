@@ -20,6 +20,9 @@ _G.PaperWMNativeAnimationCleanup = nil
 local position_animations = {}
 local position_animation_timer = nil
 local move_generations = {}
+local focus_guard_target = nil
+local focus_guard_timer = nil
+local focus_guard_generation = 0
 local animation_interval <const> = 1 / 60
 local watcher_restart_padding <const> = 0.02
 local default_animation_curve <const> = { 0.2, 0.0, 0.0, 1.0 }
@@ -201,50 +204,94 @@ local function animatePosition(window, start_frame, end_frame, watcher, generati
     end
 end
 
--- Optional compositor backend. The helper applies private SkyLight
--- presentation transforms and position commits. Accessibility is used only
--- for a size change, outside the short WindowServer update lock.
+-- Optional native helper. It applies private SkyLight presentation transforms,
+-- commits positions with CGSMoveWindow, and performs AppKit haptic feedback.
+-- Accessibility remains only for permanent size changes and failure fallback.
+local native_helper = nil
+local native_helper_checked = false
+local native_helper_error = nil
 local native_transform = nil
 local native_transform_checked = false
 local native_transform_error = nil
+local native_haptic = nil
+local native_haptic_checked = false
+local native_haptic_error = nil
 local native_animations = {}
 local native_animation_timer = nil
 local interactive_moves = nil
 local quarantined_windows = {}
-local quarantine_timer = nil
 local interactive_profile = nil
 local last_interactive_profile = nil
 
-local function loadNativeTransform()
-    if native_transform_checked then return native_transform end
-    native_transform_checked = true
-
+local function loadNativeHelper()
+    if native_helper_checked then return native_helper end
+    native_helper_checked = true
     if not hs.spoons or not hs.spoons.resourcePath then
-        native_transform_error = "hs.spoons.resourcePath is unavailable"
+        native_helper_error = "hs.spoons.resourcePath is unavailable"
         return nil
     end
 
     local path = hs.spoons.resourcePath("native/paperwm_transform.so")
     local loader, load_error = package.loadlib(path, "luaopen_paperwm_transform")
     if not loader then
-        native_transform_error = load_error
+        native_helper_error = load_error
         return nil
     end
 
-    local loaded, transform = pcall(loader)
+    local loaded, helper = pcall(loader)
     if not loaded then
-        native_transform_error = transform
+        native_helper_error = helper
         return nil
     end
 
-    local checked, available, reason = pcall(transform.available)
+    native_helper = helper
+    return native_helper
+end
+
+local function loadNativeTransform()
+    if native_transform_checked then return native_transform end
+    native_transform_checked = true
+
+    local helper = loadNativeHelper()
+    if not helper then
+        native_transform_error = native_helper_error
+        return nil
+    end
+
+    local checked, available, reason = pcall(helper.available)
     if not checked or not available then
         native_transform_error = checked and reason or available
         return nil
     end
 
-    native_transform = transform
+    native_transform = helper
     return native_transform
+end
+
+local function loadNativeHaptic()
+    if native_haptic_checked then return native_haptic end
+    native_haptic_checked = true
+
+    local helper = loadNativeHelper()
+    if not helper then
+        native_haptic_error = native_helper_error
+        return nil
+    end
+
+    if type(helper.hapticAvailable) ~= "function" or type(helper.haptic) ~= "function" then
+        native_haptic_error = "native helper was built without haptic support"
+        return nil
+    end
+
+    local checked, available, reason = pcall(helper.hapticAvailable)
+    if not checked or not available then
+        native_haptic_error = checked and
+            (reason or "no haptic feedback performer is available") or available
+        return nil
+    end
+
+    native_haptic = helper
+    return native_haptic
 end
 
 local function nativeCall(method, ...)
@@ -262,6 +309,20 @@ local function nativeBounds(id)
     if not ok or not bounds or not bounds[1] then return nil, bounds end
     local frame = bounds[1]
     return hs.geometry.rect(frame.x, frame.y, frame.w, frame.h)
+end
+
+local function nativeBoundsBatch(items)
+    local ids = {}
+    for _, item in ipairs(items) do table.insert(ids, item.window:id()) end
+
+    local ok, bounds = nativeCall("bounds", ids)
+    if not ok then return {}, bounds end
+
+    local frames = {}
+    for _, frame in ipairs(bounds or {}) do
+        frames[frame.id] = hs.geometry.rect(frame.x, frame.y, frame.w, frame.h)
+    end
+    return frames, nil
 end
 
 local function sizesMatch(a, b)
@@ -288,60 +349,55 @@ local function identityTransforms(records)
     return transforms
 end
 
+local function commitNativePositions(records)
+    local moves = {}
+    for _, record in ipairs(records) do
+        table.insert(moves, {
+            id = record.id,
+            x = record.end_frame.x,
+            y = record.end_frame.y,
+        })
+    end
 
-local function settleNativeRecord(record, real_frame)
     local updates_disabled = nativeCall("beginUpdates")
-    local moved, move_error = nativeCall("move", {
-        { id = record.id, x = record.end_frame.x, y = record.end_frame.y },
-    })
+    local moved, move_error = nativeCall("move", moves)
     local reset_ok, reset_error = false, nil
     if moved then
-        reset_ok, reset_error = nativeCall("set", identityTransforms({ record }))
+        reset_ok, reset_error = nativeCall("set", identityTransforms(records))
     end
     if updates_disabled then nativeCall("endUpdates") end
 
-    if moved and reset_ok then return true end
+    return moved and reset_ok, move_error or reset_error
+end
 
-    -- If the native move failed, preserve the destination visually. If the
-    -- identity reset failed, the existing target transform is still in place.
-    if not moved and real_frame and real_frame.w > 0 and real_frame.h > 0 then
+local function settleNativeRecord(record, real_frame)
+    local committed, commit_error = commitNativePositions({ record })
+    if committed then return true end
+
+    -- Keep AX as a bounded fallback when WindowServer rejects the permanent
+    -- move. Intermediate animation frames never use this path.
+    local positioned, position_result = pcall(
+        record.window.setTopLeft, record.window,
+        record.end_frame.x, record.end_frame.y)
+    positioned = positioned and position_result ~= false
+    local reset_ok, reset_error = nativeCall("set", identityTransforms({ record }))
+    if positioned and reset_ok then return true end
+
+    if not positioned and real_frame and real_frame.w > 0 and real_frame.h > 0 then
         nativeCall("set", { targetTransform(record, real_frame) })
     end
-    return false, move_error or reset_error
+    return false, commit_error or
+        (not positioned and position_result) or reset_error
 end
 
-local retryQuarantinedWindow
-
-local function ensureQuarantineTimer()
-    if quarantine_timer then return end
-    quarantine_timer = Timer.new(0.25, function()
-        local now = Timer.secondsSinceEpoch()
-        for _, record in pairs(quarantined_windows) do
-            if now >= record.next_retry then
-                retryQuarantinedWindow(record)
-                break -- at most one bounded AX request per tick
-            end
-        end
-        if not next(quarantined_windows) and quarantine_timer then
-            quarantine_timer:stop()
-            quarantine_timer = nil
-        end
-    end)
-    quarantine_timer:start()
-end
-
-local function quarantineWindow(record, real_frame, reason)
-    record.real_frame = real_frame or record.real_frame
-    record.retry_delay = math.min((record.retry_delay or 0.5) * 2, 8)
-    record.next_retry = Timer.secondsSinceEpoch() + record.retry_delay
-    quarantined_windows[record.id] = record
-    if record.real_frame and record.real_frame.w > 0 and record.real_frame.h > 0 then
-        nativeCall("set", { targetTransform(record, record.real_frame) })
-    end
-    ensureQuarantineTimer()
+local function abandonNativeRecord(record, reason)
+    quarantined_windows[record.id] = nil
+    nativeCall("set", identityTransforms({ record }))
+    restartWatcherAfter(watcher_restart_padding, record.id,
+        record.watcher, record.generation)
     if Windows.PaperWM then
         Windows.PaperWM.logger.wf(
-            "window %d resize deferred; retaining compositor transform: %s",
+            "window %d native commit abandoned: %s",
             record.id, tostring(reason or "Accessibility size did not converge"))
     end
 end
@@ -355,12 +411,12 @@ local function commitNativeRecord(record)
             quarantined_windows[record.id] = nil
             return true
         end
-        quarantineWindow(record, record.real_frame, bounds_error)
+        abandonNativeRecord(record, bounds_error)
         return false
     end
     record.missing_count = 0
     if real_frame.w <= 0 or real_frame.h <= 0 then
-        quarantineWindow(record, real_frame, "WindowServer reported empty bounds")
+        abandonNativeRecord(record, "WindowServer reported empty bounds")
         return false
     end
 
@@ -373,26 +429,18 @@ local function commitNativeRecord(record)
         local resized_frame = nativeBounds(record.id)
         if resized_frame then real_frame = resized_frame end
         if not resized or not sizesMatch(real_frame, record.end_frame) then
-            quarantineWindow(record, real_frame, resize_error)
+            abandonNativeRecord(record, resize_error)
             return false
         end
     end
 
     local settled, settle_error = settleNativeRecord(record, real_frame)
     if not settled then
-        quarantineWindow(record, real_frame, settle_error)
+        abandonNativeRecord(record, settle_error)
         return false
     end
     quarantined_windows[record.id] = nil
     return true
-end
-
-retryQuarantinedWindow = function(record)
-    if quarantined_windows[record.id] ~= record then return end
-    if commitNativeRecord(record) then
-        restartWatcherAfter(watcher_restart_padding, record.id,
-            record.watcher, record.generation)
-    end
 end
 
 local function commitNativeAnimations(records, set_real_positions)
@@ -438,6 +486,44 @@ local function stopAllNativeAnimations(set_real_positions)
     end
 end
 
+-- Take ownership of position-only native animations without resetting their
+-- presentation transforms. This lets a new gesture interrupt a layout snap at
+-- the exact frame currently visible on screen.
+local function adoptNativeAnimationFrames(items)
+    if not next(native_animations) then return nil, nil, false end
+
+    local frames, real_frames = {}, {}
+    local adopted = {}
+    for _, item in ipairs(items) do
+        local animation = native_animations[item.window:id()]
+        if animation then
+            if math.abs(animation.sx - 1) > 0.001 or
+                math.abs(animation.sy - 1) > 0.001 or
+                not sizesMatch(animation.real_frame, animation.end_frame) then
+                return nil, nil, true
+            end
+
+            frames[animation.id] = hs.geometry.rect(
+                animation.x, animation.y,
+                animation.real_frame.w, animation.real_frame.h)
+            real_frames[animation.id] = hs.geometry.rect(
+                animation.real_frame.x, animation.real_frame.y,
+                animation.real_frame.w, animation.real_frame.h)
+            table.insert(adopted, animation)
+        end
+    end
+    if #adopted == 0 then return nil, nil, false end
+
+    for _, animation in ipairs(adopted) do
+        native_animations[animation.id] = nil
+    end
+    if not next(native_animations) and native_animation_timer then
+        native_animation_timer:stop()
+        native_animation_timer = nil
+    end
+    return frames, real_frames, false
+end
+
 local function animateNativeFrames()
     local now = Timer.secondsSinceEpoch()
     local transforms, finished, abandoned = {}, {}, {}
@@ -473,7 +559,7 @@ local function animateNativeFrames()
     if #abandoned > 0 then commitNativeAnimations(abandoned, false) end
 
     if #transforms > 0 then
-        local transformed, reason = nativeCall("set", transforms)
+        local transformed, reason = nativeCall("setAtomic", transforms)
         if not transformed then
             native_transform_error = reason
             stopAllNativeAnimations(true)
@@ -545,30 +631,34 @@ local function finishInteractiveMove(set_real_positions)
     local records = {}
     for _, record in pairs(interactive_moves) do table.insert(records, record) end
 
-    local updates_disabled = nativeCall("beginUpdates")
-    local moved, move_error = true, nil
+    local committed, commit_error = true, nil
+    local position_errors = {}
     if set_real_positions then
-        local moves = {}
-        for _, record in ipairs(records) do
-            table.insert(moves, {
-                id = record.id,
-                x = record.end_frame.x,
-                y = record.end_frame.y,
-            })
+        committed, commit_error = commitNativePositions(records)
+        if not committed then
+            for _, record in ipairs(records) do
+                local positioned, result = pcall(
+                    record.window.setTopLeft, record.window,
+                    record.end_frame.x, record.end_frame.y)
+                if not positioned or result == false then
+                    position_errors[record.id] = result
+                end
+            end
+            local reset_ok, reset_error =
+                nativeCall("set", identityTransforms(records))
+            committed = reset_ok and not next(position_errors)
+            commit_error = commit_error or reset_error
         end
-        moved, move_error = nativeCall("move", moves)
+    else
+        committed, commit_error =
+            nativeCall("set", identityTransforms(records))
     end
-    local reset_ok, reset_error = false, nil
-    if moved or not set_real_positions then
-        reset_ok, reset_error = nativeCall("set", identityTransforms(records))
-    end
-    if updates_disabled then nativeCall("endUpdates") end
     interactive_moves = nil
 
-    if set_real_positions and (not moved or not reset_ok) then
+    if set_real_positions and not committed then
         for _, record in ipairs(records) do
-            quarantineWindow(record, nativeBounds(record.id) or record.real_frame,
-                move_error or reset_error)
+            local position_error = position_errors[record.id]
+            abandonNativeRecord(record, position_error or commit_error)
         end
     end
 
@@ -580,7 +670,14 @@ local function finishInteractiveMove(set_real_positions)
         last_interactive_profile = interactive_profile
         if Windows.PaperWM then
             Windows.PaperWM.logger.df(
-                "interactive latency: input %.2f ms avg/%.2f max, SkyLight %.2f ms avg/%.2f max",
+                "interactive latency: setup %.2f ms (%d windows; pre-begin %.2f, native check %.2f, cleanup %.2f, bounds %.2f, fallback AX %.2f), input %.2f ms avg/%.2f max, SkyLight %.2f ms avg/%.2f max",
+                interactive_profile.gesture_setup_ms or 0,
+                interactive_profile.window_count or 0,
+                interactive_profile.pre_begin_ms or 0,
+                interactive_profile.native_check_ms or 0,
+                interactive_profile.cleanup_ms or 0,
+                interactive_profile.bounds_ms or 0,
+                interactive_profile.fallback_ax_ms or 0,
                 interactive_profile.average_input_age_ms,
                 interactive_profile.max_input_age_ms,
                 interactive_profile.average_skylight_ms,
@@ -589,10 +686,11 @@ local function finishInteractiveMove(set_real_positions)
     end
     interactive_profile = nil
 
-    if (not moved or not reset_ok) and Windows.PaperWM then
+    if not committed and Windows.PaperWM then
         Windows.PaperWM.logger.ef(
             "could not commit interactive native move: %s",
-            tostring(move_error or reset_error))
+            tostring(next(position_errors) and "Accessibility position failed" or
+                commit_error))
     end
 end
 
@@ -605,13 +703,15 @@ local function clearQuarantinedWindows()
         restartWatcherAfter(watcher_restart_padding, id,
             record.watcher, record.generation)
     end
-    if quarantine_timer then
-        quarantine_timer:stop()
-        quarantine_timer = nil
-    end
 end
 
 _G.PaperWMNativeAnimationCleanup = function()
+    focus_guard_generation = focus_guard_generation + 1
+    focus_guard_target = nil
+    if focus_guard_timer then
+        focus_guard_timer:stop()
+        focus_guard_timer = nil
+    end
     stopAllNativeAnimations(true)
     finishInteractiveMove(true)
     clearQuarantinedWindows()
@@ -688,8 +788,49 @@ end
 ---@return boolean
 ---@return string|nil
 function Windows.nativeAnimationStatus()
+    if native_transform_error then return false, native_transform_error end
     if loadNativeTransform() then return true, nil end
     return false, native_transform_error
+end
+
+---diagnose private transform entry points for managed windows
+---@param ids number[]|nil
+---@return table|nil
+---@return string|nil
+function Windows.nativeProbe(ids)
+    local helper = loadNativeHelper()
+    if not helper or type(helper.probe) ~= "function" then
+        return nil, native_helper_error or
+            "native helper was built without probe support"
+    end
+
+    if not ids then
+        ids = {}
+        for id in pairs(Windows.PaperWM.state.index_table) do
+            table.insert(ids, id)
+        end
+        table.sort(ids)
+    end
+
+    local called, result = pcall(helper.probe, ids)
+    if not called then return nil, result end
+    return result, nil
+end
+
+---perform one immediate trackpad haptic tick
+---@return boolean
+---@return string|nil
+function Windows.performHapticFeedback()
+    local helper = loadNativeHaptic()
+    if not helper then return false, native_haptic_error end
+
+    local called, result, reason = pcall(helper.haptic)
+    if called and result then return true, nil end
+
+    native_haptic = nil
+    native_haptic_checked = true
+    native_haptic_error = called and reason or result
+    return false, native_haptic_error
 end
 
 ---return timing from the most recently completed compositor gesture
@@ -699,16 +840,72 @@ function Windows.interactiveLatencyStatus()
 end
 
 ---begin a compositor-backed interactive position gesture
----@param items table[] tables containing a window and its current frame
+---@param items table[] tables containing a window and optional current frame
+---@param gesture_started number|nil absolute time before gesture setup began
 ---@return boolean
-function Windows.beginInteractiveMove(items)
-    if not nativeBackendEnabled() then return false end
+---@return boolean swipe_blocked
+function Windows.beginInteractiveMove(items, gesture_started)
+    local begin_started = Timer.absoluteTime()
+    gesture_started = gesture_started or begin_started
 
+    local native_check_started = Timer.absoluteTime()
+    local native_enabled = nativeBackendEnabled()
+    local native_check_ms = (Timer.absoluteTime() - native_check_started) / 1000000
+    if not native_enabled then
+        for _, item in ipairs(items) do
+            if not item.frame then item.frame = item.window:frame() end
+        end
+        return false, false
+    end
+
+    if interactive_moves then
+        local record_count = 0
+        for _ in pairs(interactive_moves) do record_count = record_count + 1 end
+        local can_resume = record_count == #items
+        for _, item in ipairs(items) do
+            if not interactive_moves[item.window:id()] then
+                can_resume = false
+                break
+            end
+        end
+
+        if can_resume then
+            for _, item in ipairs(items) do
+                local record = interactive_moves[item.window:id()]
+                item.frame = hs.geometry.rect(
+                    record.end_frame.x, record.end_frame.y,
+                    record.end_frame.w, record.end_frame.h)
+                item.x = record.end_frame.x
+            end
+            if interactive_profile then
+                interactive_profile.resume_count =
+                    (interactive_profile.resume_count or 0) + 1
+            end
+            return true, false
+        end
+    end
+
+    local cleanup_started = Timer.absoluteTime()
     finishInteractiveMove(true)
-    stopAllNativeAnimations(true)
     stopAllPositionAnimations(true)
+    local adopted_frames, adopted_real_frames, adoption_blocked =
+        adoptNativeAnimationFrames(items)
+    if adoption_blocked then return false, true end
+    if not adopted_frames then stopAllNativeAnimations(true) end
+    local cleanup_ms = (Timer.absoluteTime() - cleanup_started) / 1000000
+
+    local bounds_started = Timer.absoluteTime()
+    local frames = nativeBoundsBatch(items)
+    local bounds_ms = (Timer.absoluteTime() - bounds_started) / 1000000
+
     interactive_moves = {}
     interactive_profile = {
+        window_count = #items,
+        pre_begin_ms = (begin_started - gesture_started) / 1000000,
+        native_check_ms = native_check_ms,
+        cleanup_ms = cleanup_ms,
+        bounds_ms = bounds_ms,
+        fallback_ax_ms = 0,
         samples = 0,
         total_input_age_ms = 0,
         max_input_age_ms = 0,
@@ -721,26 +918,40 @@ function Windows.beginInteractiveMove(items)
         -- Invalidate any delayed watcher restart left by an interrupted
         -- animation; the gesture owner restarts its watchers when it ends.
         move_generations[id] = (move_generations[id] or 0) + 1
-        local frame = nativeBounds(id) or item.window:frame()
+        local adopted_frame = adopted_frames and adopted_frames[id]
+        local frame = adopted_frame or frames[id] or item.frame
+        if not frame then
+            local fallback_started = Timer.absoluteTime()
+            frame = item.window:frame()
+            interactive_profile.fallback_ax_ms = interactive_profile.fallback_ax_ms +
+                ((Timer.absoluteTime() - fallback_started) / 1000000)
+        end
+        local real_frame = (adopted_real_frames and adopted_real_frames[id]) or frame
+        if adopted_frame then item.x = adopted_frame.x end
         item.frame = hs.geometry.rect(frame.x, frame.y, frame.w, frame.h)
         interactive_moves[id] = {
             id = id,
             window = item.window,
             watcher = Windows.PaperWM.state.ui_watchers[id],
             generation = move_generations[id],
-            real_frame = frame,
+            real_frame = real_frame,
             end_frame = hs.geometry.rect(frame.x, frame.y, frame.w, frame.h),
         }
     end
-    return true
+    interactive_profile.gesture_setup_ms =
+        (Timer.absoluteTime() - gesture_started) / 1000000
+    return true, false
 end
 
 ---apply one batched compositor update during an interactive gesture
 ---@param items table[] tables containing a window and desired frame
 ---@param input_timestamp number|nil event timestamp in absolute nanoseconds
 ---@return boolean
+---@return string|nil
 function Windows.updateInteractiveMove(items, input_timestamp)
-    if not interactive_moves then return false end
+    if not interactive_moves then
+        return false, "no interactive compositor move is active"
+    end
 
     local transforms = {}
     for _, item in ipairs(items) do
@@ -761,7 +972,7 @@ function Windows.updateInteractiveMove(items, input_timestamp)
     local call_started = Timer.absoluteTime()
     local input_age_ms = input_timestamp and input_timestamp > 0 and
         math.max(0, (call_started - input_timestamp) / 1000000) or 0
-    local transformed, reason = nativeCall("set", transforms)
+    local transformed, reason = nativeCall("setAtomic", transforms)
     local skylight_ms = (Timer.absoluteTime() - call_started) / 1000000
     if interactive_profile then
         interactive_profile.samples = interactive_profile.samples + 1
@@ -774,13 +985,13 @@ function Windows.updateInteractiveMove(items, input_timestamp)
         interactive_profile.max_skylight_ms =
             math.max(interactive_profile.max_skylight_ms, skylight_ms)
     end
-    if transformed then return true end
+    if transformed then return true, nil end
 
     native_transform_error = reason
     finishInteractiveMove(true)
     Windows.PaperWM.logger.ef(
         "interactive native move failed; falling back to Accessibility: %s", reason)
-    return false
+    return false, reason
 end
 
 ---commit and clear an interactive compositor gesture
@@ -1114,13 +1325,43 @@ function Windows.removeWindowIndex(remove_index, remove_id)
     return remove_index.space -- return space for removed window
 end
 
+local function beginFocusGuard(window)
+    focus_guard_generation = focus_guard_generation + 1
+    local generation = focus_guard_generation
+    focus_guard_target = window
+    if focus_guard_timer then focus_guard_timer:stop() end
+
+    focus_guard_timer = Timer.doAfter(
+        math.max(0, Window.animationDuration) + watcher_restart_padding,
+        function()
+            if generation ~= focus_guard_generation then return end
+            local target = focus_guard_target
+            focus_guard_target = nil
+            focus_guard_timer = nil
+            if target and Window.focusedWindow() ~= target then
+                pcall(target.focus, target)
+            end
+        end)
+    pcall(window.focus, window)
+end
+
+---redirect transient focus changes while a keyboard transition owns focus
+---@param window Window
+---@return boolean
+function Windows.redirectTransientFocus(window)
+    local target = focus_guard_target
+    if not target or window:id() == target:id() then return false end
+    local redirected = pcall(target.focus, target)
+    return redirected
+end
+
 ---move focus to a new window next to the currently focused window
 ---@param direction Direction use either Direction UP, DOWN, LEFT, or RIGHT
 ---@param focused_index Index index of focused window within the window_list
 function Windows.focusWindow(direction, focused_index)
     if not focused_index then
         -- get current focused window
-        local focused_window = Window.focusedWindow()
+        local focused_window = focus_guard_target or Window.focusedWindow()
         if not focused_window then
             Windows.PaperWM.logger.d("focused window not found")
             return
@@ -1171,16 +1412,8 @@ function Windows.focusWindow(direction, focused_index)
         return
     end
 
-    -- focus new window, windowFocused event will be emited immediately
-    new_focused_window:focus()
-
-    -- try to prevent MacOS from stealing focus away to another window
-    Timer.doAfter(Window.animationDuration, function()
-        if Window.focusedWindow() ~= new_focused_window then
-            Windows.PaperWM.logger.df("refocusing window %s", new_focused_window)
-            new_focused_window:focus()
-        end
-    end)
+    -- Keep the destination focused for the complete layout transition.
+    beginFocusGuard(new_focused_window)
 
     return new_focused_window
 end

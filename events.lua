@@ -19,19 +19,23 @@ Events.__index = Events
 -- windowsChanged back-to-back. Tile once after that burst instead of starting
 -- and replacing several animations in the same run-loop turn.
 local pending_layout_timers = {}
+local swipe_active_spaces = {}
 local layout_debounce <const> = 0.015
 
 local function scheduleTile(self, space)
+    if swipe_active_spaces[space] then return end
     local pending = pending_layout_timers[space]
     if pending then pending:stop() end
 
     pending_layout_timers[space] = Timer.doAfter(layout_debounce, function()
         pending_layout_timers[space] = nil
+        if swipe_active_spaces[space] then return end
         self.space.tileSpace(space)
     end)
 end
 
 local function tileImmediately(self, space)
+    if swipe_active_spaces[space] then return end
     local pending = pending_layout_timers[space]
     if pending then
         pending:stop()
@@ -58,6 +62,7 @@ local function tileWithoutAnimation(self, space)
 end
 
 local function throttleTile(self, space)
+    if swipe_active_spaces[space] then return end
     local pending = pending_layout_timers[space]
     if pending then
         pending:stop()
@@ -76,6 +81,109 @@ local function throttleTile(self, space)
             tileWithoutAnimation(self, space)
         end)
     end
+end
+
+local pending_swipe_settles = {}
+local active_swipe_inertia = nil
+local last_swipe_status = nil
+local default_swipe_settle_delay <const> = 0.25
+local swipe_inertia_interval <const> = 1 / 60
+local swipe_velocity_response <const> = 0.025
+local swipe_release_max_age <const> = 0.2
+local swipe_trace_path <const> = "/tmp/paperwm_swipe_trace.log"
+
+local function traceSwipe(self, format, ...)
+    if not self.swipe_debug_trace then return end
+    local file = io.open(swipe_trace_path, "a")
+    if not file then return end
+    file:write(string.format("%.6f ", Timer.secondsSinceEpoch()))
+    file:write(string.format(format, ...))
+    file:write("\n")
+    file:close()
+end
+
+local function startSpaceWatchers(self, space)
+    for _, column in ipairs(self.state.window_list[space] or {}) do
+        for _, window in ipairs(column) do
+            local watcher = self.state.ui_watchers[window:id()]
+            if watcher then watcher:start({ Watcher.windowMoved, Watcher.windowResized }) end
+        end
+    end
+end
+
+local function cancelActiveSwipeInertia(next_space)
+    local inertia = active_swipe_inertia
+    if not inertia then return end
+
+    active_swipe_inertia = nil
+    inertia.timer:stop()
+    if last_swipe_status then last_swipe_status.inertia_interrupted = true end
+    local preserve_transform = next_space == inertia.space
+    inertia.release(preserve_transform, false)
+    if not preserve_transform then swipe_active_spaces[inertia.space] = nil end
+end
+
+---return metrics from the most recent swipe release or rejection
+---@return table|nil
+function Events.swipeStatus()
+    if not last_swipe_status then return nil end
+    local status = {}
+    for key, value in pairs(last_swipe_status) do status[key] = value end
+    status.inertia_active = active_swipe_inertia ~= nil
+    return status
+end
+
+local function cancelPendingLayout(space)
+    local pending = pending_layout_timers[space]
+    if pending then
+        pending:stop()
+        pending_layout_timers[space] = nil
+    end
+end
+
+local function cancelSwipeSettle(space)
+    local pending = pending_swipe_settles[space]
+    if pending then
+        pending:stop()
+        pending_swipe_settles[space] = nil
+    end
+end
+
+local function scheduleSwipeSettle(self, space, screen_frame, retained_transform)
+    cancelSwipeSettle(space)
+    local delay = math.max(0, tonumber(self.swipe_settle_delay) or
+        default_swipe_settle_delay)
+    pending_swipe_settles[space] = Timer.doAfter(delay, function()
+        pending_swipe_settles[space] = nil
+        if retained_transform then self.windows.endInteractiveMove() end
+        startSpaceWatchers(self, space)
+        swipe_active_spaces[space] = nil
+
+        local focused_window = Window.focusedWindow()
+        if not focused_window then
+            self.logger.e("no focused window at end of swipe")
+            return
+        end
+
+        local frame = self.windows.getWindowFrame(focused_window)
+        local visible_window = nil
+        local focused_offscreen = false
+        if frame.x < screen_frame.x then
+            focused_offscreen = true
+            visible_window = self.windows.getFirstVisibleWindow(
+                space, screen_frame, self.windows.Direction.LEFT)
+        elseif frame.x2 > screen_frame.x2 then
+            focused_offscreen = true
+            visible_window = self.windows.getFirstVisibleWindow(
+                space, screen_frame, self.windows.Direction.RIGHT)
+        end
+
+        if visible_window then
+            visible_window:focus()
+        elseif focused_offscreen then
+            self.space.tileSpace(space)
+        end
+    end)
 end
 
 ---initialize module with reference to PaperWM
@@ -116,6 +224,11 @@ function Events.windowEventHandler(window, event, self)
     local space = nil
     local tile_immediately = false
     local tile_throttled = false
+
+    if event == "windowFocused" and
+        self.windows.redirectTransientFocus(window) then
+        return
+    end
 
     --[[ When a new window is created, We first get a windowVisible event but
     without a Space. Next we receive a windowFocused event for the window, but
@@ -224,84 +337,226 @@ end
 ---@param self PaperWM
 ---@param space Space
 ---@param screen_frame Frame
-local function slide_windows(self, space, screen_frame)
+---@param gesture_started number|nil absolute time when gesture setup began
+---@param initial_input_timestamp number|nil gesture begin timestamp in absolute nanoseconds
+---@param initial_sample_timestamp number gesture begin callback time in absolute nanoseconds
+local function slide_windows(self, space, screen_frame, gesture_started,
+        initial_input_timestamp, initial_sample_timestamp)
     local left_margin  = screen_frame.x + self.screen_margin
     local right_margin = screen_frame.x2 - self.screen_margin
 
-    -- cache windows, frame, and virtual x positions because window lookup is expensive
-    -- stop window watchers
-    local windows      = {}
-    for id, x in pairs(self.state.x_positions[space] or {}) do
-        local window = Window(id)
-        if window then
-            local watcher = self.state.ui_watchers[id]
-            if watcher then watcher:stop() end
-            local frame = self.windows.getWindowFrame(window)
-            table.insert(windows, { window = window, frame = frame, x = x })
-        end
-    end
-    local compositor_active = self.windows.beginInteractiveMove(windows)
-
-    while true do
-        local dx, input_timestamp = coroutine.yield()
-        if not dx then break end
-
-        if dx ~= 0 then
-            for _, item in ipairs(windows) do
-                item.x = item.x + dx                               -- scroll left or right
-                item.frame.x = dx > 0 and math.min(item.x, right_margin) or math.max(item.x, left_margin - item.frame.w)
-            end
-            if compositor_active then
-                compositor_active = self.windows.updateInteractiveMove(windows, input_timestamp)
-            else
-                for _, item in ipairs(windows) do
-                    item.window:setTopLeft(item.frame.x, item.frame.y)
-                end
+    -- Reuse cached Window objects; reconstructing each one by ID can make a
+    -- synchronous Accessibility request before the first gesture frame.
+    local windows = {}
+    local x_positions = self.state.x_positions[space] or {}
+    for _, column in ipairs(self.state.window_list[space] or {}) do
+        for _, window in ipairs(column) do
+            local id = window:id()
+            local x = x_positions[id]
+            if x then
+                table.insert(windows, { window = window, x = x })
             end
         end
     end
-
-    if compositor_active then self.windows.endInteractiveMove() end
-
-    -- start window watchers
+    local compositor_active, swipe_blocked =
+        self.windows.beginInteractiveMove(windows, gesture_started)
+    traceSwipe(self, "compositor begin active=%s blocked=%s windows=%d",
+        tostring(compositor_active), tostring(swipe_blocked), #windows)
+    if swipe_blocked then return "blocked" end
     for _, item in ipairs(windows) do
         local watcher = self.state.ui_watchers[item.window:id()]
-        if watcher then watcher:start({ Watcher.windowMoved, Watcher.windowResized }) end
+        if watcher then watcher:stop() end
     end
-    windows = nil -- force collection
 
-    -- ensure a focused window is on screen
-    local focused_window = Window.focusedWindow()
-    if focused_window then
-        local frame = self.windows.getWindowFrame(focused_window)
-        local visible_window = (function()
-            if frame.x < screen_frame.x then
-                return self.windows.getFirstVisibleWindow(space, screen_frame,
-                    self.windows.Direction.LEFT)
-            elseif frame.x2 > screen_frame.x2 then
-                return self.windows.getFirstVisibleWindow(space, screen_frame,
-                    self.windows.Direction.RIGHT)
-            end
-        end)()
-        if visible_window then
-            visible_window:focus()
-        else
-            self.space.tileSpace(space)
+    local moved = false
+    local velocity = 0
+    local last_sample_timestamp = initial_sample_timestamp
+    local velocity_samples = 0
+
+    local function clampStripDelta(dx)
+        if not compositor_active or dx == 0 or #windows == 0 then return dx end
+
+        local content_left, content_right = math.huge, -math.huge
+        for _, item in ipairs(windows) do
+            content_left = math.min(content_left, item.x)
+            content_right = math.max(content_right, item.x + item.frame.w)
         end
-    else
-        self.logger.e("no focused window at end of swipe")
+        return Events.Swipe.clampStripDelta(
+            dx, content_left, content_right, left_margin, right_margin)
     end
 
-    while true do
-        self.logger.ef("resumed finished slide_windows coroutine with: %s", coroutine.yield())
+    local function applyDelta(dx, input_timestamp)
+        dx = clampStripDelta(dx)
+        if dx == 0 then return 0 end
+
+        moved = true
+        for _, item in ipairs(windows) do
+            item.x = item.x + dx
+            -- Presentation transforms can move fully off-screen, so keep
+            -- the native strip rigid. Per-window edge clamping makes a
+            -- trailing window stop while its neighbors keep moving.
+            item.frame.x = compositor_active and item.x or
+                (dx > 0 and math.min(item.x, right_margin) or
+                    math.max(item.x, left_margin - item.frame.w))
+        end
+        if compositor_active then
+            local updated, reason =
+                self.windows.updateInteractiveMove(windows, input_timestamp)
+            if not updated then
+                traceSwipe(self, "compositor update failed reason=%s",
+                    tostring(reason))
+            end
+            compositor_active = updated
+        else
+            for _, item in ipairs(windows) do
+                item.window:setTopLeft(item.frame.x, item.frame.y)
+            end
+        end
+        return dx
     end
+
+    local function releaseOwnership(retain_transform, settle)
+        local retained_transform = retain_transform and compositor_active and moved
+        if compositor_active and not retained_transform then
+            self.windows.endInteractiveMove()
+        end
+
+        for _, item in ipairs(windows) do
+            local id = item.window:id()
+            if moved then x_positions[id] = item.x end
+            if not retained_transform then
+                local watcher = self.state.ui_watchers[id]
+                if watcher then watcher:start({ Watcher.windowMoved, Watcher.windowResized }) end
+            end
+        end
+        windows = nil
+
+        if settle then
+            if moved then
+                scheduleSwipeSettle(self, space, screen_frame, retained_transform)
+            else
+                swipe_active_spaces[space] = nil
+            end
+        end
+    end
+
+    local release_timestamp = nil
+    local release_sample_timestamp = nil
+    while true do
+        local dx, input_timestamp, sample_timestamp = coroutine.yield()
+        if not dx then
+            release_timestamp = input_timestamp
+            release_sample_timestamp = sample_timestamp
+            break
+        end
+
+        if dx ~= 0 then
+            if sample_timestamp and last_sample_timestamp and
+                sample_timestamp > last_sample_timestamp then
+                velocity = Events.Swipe.velocitySample(
+                    velocity, dx, (sample_timestamp - last_sample_timestamp) / 1000000000,
+                    swipe_velocity_response)
+                velocity_samples = velocity_samples + 1
+                traceSwipe(self, "velocity sample=%d dx=%.3f dt_ms=%.3f velocity=%.3f",
+                    velocity_samples, dx,
+                    (sample_timestamp - last_sample_timestamp) / 1000000, velocity)
+            end
+            last_sample_timestamp = sample_timestamp
+            applyDelta(dx, input_timestamp)
+        end
+    end
+
+    local release_age = release_sample_timestamp and last_sample_timestamp and
+        math.max(0, (release_sample_timestamp - last_sample_timestamp) / 1000000000) or 0
+    local release_is_fresh = release_age <= swipe_release_max_age
+    local min_velocity = math.max(1, tonumber(self.swipe_inertia_min_velocity) or 40)
+    local max_velocity = math.max(min_velocity,
+        tonumber(self.swipe_inertia_max_velocity) or 6000)
+    velocity = math.max(-max_velocity, math.min(max_velocity, velocity))
+    last_swipe_status = {
+        space = space,
+        release_velocity = velocity,
+        velocity_samples = velocity_samples,
+        release_age_ms = release_age * 1000,
+        event_begin_timestamp = initial_input_timestamp,
+        event_release_timestamp = release_timestamp,
+        compositor_active = compositor_active,
+        inertia_started = false,
+    }
+    traceSwipe(self,
+        "release moved=%s compositor=%s velocity=%.3f samples=%d age_ms=%.3f event_begin=%s event_end=%s",
+        tostring(moved), tostring(compositor_active), velocity, velocity_samples,
+        release_age * 1000, tostring(initial_input_timestamp), tostring(release_timestamp))
+
+    if self.swipe_inertia and moved and release_is_fresh and
+        math.abs(velocity) >= min_velocity then
+        local friction = math.max(0.01,
+            tonumber(self.swipe_inertia_friction) or 3.5)
+        last_swipe_status.inertia_started = true
+        traceSwipe(self, "inertia start velocity=%.3f friction=%.3f", velocity, friction)
+        local last_tick = Timer.secondsSinceEpoch()
+        local inertia = { space = space }
+        local inertia_ticks = 0
+
+        function inertia.release(preserve_transform, settle)
+            releaseOwnership(preserve_transform, settle)
+        end
+
+        inertia.timer = Timer.new(swipe_inertia_interval, function()
+            local now = Timer.secondsSinceEpoch()
+            local elapsed = math.max(0, math.min(0.05, now - last_tick))
+            last_tick = now
+            local dx
+            dx, velocity = Events.Swipe.inertiaStep(velocity, elapsed, friction)
+            local applied_dx = applyDelta(dx)
+            inertia_ticks = inertia_ticks + 1
+            if inertia_ticks == 1 or inertia_ticks % 10 == 0 then
+                traceSwipe(self,
+                    "inertia tick=%d dt_ms=%.3f dx=%.3f applied=%.3f velocity=%.3f",
+                    inertia_ticks, elapsed * 1000, dx, applied_dx, velocity)
+            end
+            if applied_dx == 0 or math.abs(applied_dx) + 0.001 < math.abs(dx) then
+                velocity = 0
+                last_swipe_status.edge_clamped = true
+                traceSwipe(self, "inertia edge clamp requested=%.3f applied=%.3f",
+                    dx, applied_dx)
+            end
+
+            if math.abs(velocity) < min_velocity then
+                inertia.timer:stop()
+                if active_swipe_inertia == inertia then active_swipe_inertia = nil end
+                last_swipe_status.inertia_finished = true
+                traceSwipe(self, "inertia finish ticks=%d velocity=%.3f",
+                    inertia_ticks, velocity)
+                inertia.release(true, true)
+            end
+        end)
+        active_swipe_inertia = inertia
+        inertia.timer:start()
+        return
+    end
+
+    if not self.swipe_inertia then
+        last_swipe_status.inertia_skipped = "disabled"
+    elseif not moved then
+        last_swipe_status.inertia_skipped = "no horizontal movement"
+    elseif not release_is_fresh then
+        last_swipe_status.inertia_skipped = "release sample too old"
+    else
+        last_swipe_status.inertia_skipped = "release velocity below threshold"
+    end
+    traceSwipe(self, "inertia skipped reason=%s",
+        tostring(last_swipe_status.inertia_skipped))
+
+    releaseOwnership(true, true)
 end
 
 ---generate callback function for touchpad swipe gesture event
 ---@param self PaperWM
 function Events.swipeHandler(self)
     -- saved upvalues between callback function calls
-    local swipe_coro, screen_frame, horizontal = nil, nil, nil
+    local swipe_coro, swipe_id, screen_frame, horizontal = nil, nil, nil, nil
+    local haptic_distance = 0
 
     ---callback for touchpad swipe gesture event
     ---@param id number unique id across callbacks for the same swipe
@@ -309,7 +564,21 @@ function Events.swipeHandler(self)
     ---@param dx number change in horizonal position since last callback: between 0 and 1
     ---@param dy number change in vertical position since last callback: between 0 and 1
     return function(id, type, dx, dy, input_timestamp)
+        local callback_timestamp = Timer.absoluteTime()
+        traceSwipe(self,
+            "callback id=%s type=%s dx=%.6f dy=%.6f event_ts=%s callback_ts=%s",
+            tostring(id), tostring(type), dx, dy, tostring(input_timestamp),
+            tostring(callback_timestamp))
         if type == Events.Swipe.BEGIN then
+            local gesture_started = callback_timestamp
+
+            -- Defensively close a recognizer lifecycle that did not deliver
+            -- END before a replacement gesture.
+            if swipe_coro then
+                swipe_coro(nil, input_timestamp, callback_timestamp)
+                swipe_coro = nil
+                swipe_id = nil
+            end
 
             -- use focused window for space to scroll windows
             local focused_window = Window.focusedWindow()
@@ -330,22 +599,52 @@ function Events.swipeHandler(self)
                 return
             end
 
+            cancelActiveSwipeInertia(focused_index.space)
+            cancelPendingLayout(focused_index.space)
+            cancelSwipeSettle(focused_index.space)
+
             -- cache upvalues
             screen_frame = screen:frame()
             horizontal = nil
+            haptic_distance = 0
             swipe_coro = coroutine.wrap(slide_windows)
-            swipe_coro(self, focused_index.space, screen_frame)
-        elseif swipe_coro and type == Events.Swipe.END then
+            local start_status = swipe_coro(
+                self, focused_index.space, screen_frame, gesture_started,
+                input_timestamp, callback_timestamp)
+            if start_status == "blocked" then
+                last_swipe_status = {
+                    space = focused_index.space,
+                    blocked = true,
+                    inertia_started = false,
+                    inertia_skipped = "native resize snap active",
+                }
+                swipe_coro = nil
+                swipe_id = nil
+                return
+            end
+            swipe_id = id
+            swipe_active_spaces[focused_index.space] = true
+        elseif swipe_coro and swipe_id == id and type == Events.Swipe.END then
             self.logger.df("swipe end: %d", id)
-            swipe_coro(nil)
+            swipe_coro(nil, input_timestamp, callback_timestamp)
             swipe_coro = nil
-        elseif swipe_coro and screen_frame and type == Events.Swipe.MOVED then
+            swipe_id = nil
+        elseif swipe_coro and swipe_id == id and screen_frame and
+            type == Events.Swipe.MOVED then
             if horizontal == nil and (dx ~= 0 or dy ~= 0) then
                 horizontal = math.abs(dx) > math.abs(dy)
             end
             if not horizontal then return end
             dx = self.swipe_gain * dx * screen_frame.w
-            swipe_coro(dx, input_timestamp)
+            swipe_coro(dx, input_timestamp, callback_timestamp)
+
+            local haptic_interval = tonumber(self.swipe_haptic_interval) or 0
+            local haptic_ticks
+            haptic_distance, haptic_ticks = Events.Swipe.distanceTicks(
+                haptic_distance, dx, haptic_interval)
+            for _ = 1, haptic_ticks do
+                self.windows.performHapticFeedback()
+            end
         end
     end
 end
@@ -394,9 +693,12 @@ function Events.mouseHandler(self)
                         return delete_event
                     end
                     drag_coro = coroutine.wrap(slide_windows)
-                    drag_coro(self, index.space, screen:frame())
-                    self.logger.df("drag window start for: %s", drag_window)
-                    delete_event = true
+                    if drag_coro(self, index.space, screen:frame()) == "blocked" then
+                        drag_coro = nil
+                    else
+                        self.logger.df("drag window start for: %s", drag_window)
+                        delete_event = true
+                    end
                 end
             elseif self.lift_window and flags:containExactly(self.lift_window) then
                 -- get window from cursor location, set window to floating, tile
@@ -407,7 +709,13 @@ function Events.mouseHandler(self)
                         { window = lift_window,
                           frame = self.windows.getWindowFrame(lift_window) },
                     }
-                    lift_compositor = self.windows.beginInteractiveMove(lift_items)
+                    local lift_blocked
+                    lift_compositor, lift_blocked =
+                        self.windows.beginInteractiveMove(lift_items)
+                    if lift_blocked then
+                        lift_window = nil
+                        lift_items = nil
+                    end
                 end
                 self.logger.df("lift window start for: %s", lift_window)
                 delete_event = true
@@ -451,6 +759,19 @@ end
 
 ---start monitoring for window events
 function Events.start()
+    if Events.PaperWM.swipe_debug_trace then
+        local file = io.open(swipe_trace_path, "w")
+        if file then
+            file:write("PaperWM swipe trace\n")
+            file:close()
+        end
+        Events.Swipe.trace = function(format, ...)
+            traceSwipe(Events.PaperWM, format, ...)
+        end
+    else
+        Events.Swipe.trace = nil
+    end
+
     -- listen for window events
     Events.PaperWM.window_filter:subscribe({
         WindowFilter.windowFocused, WindowFilter.windowVisible,
@@ -478,6 +799,8 @@ end
 
 ---stop monitoring for window events
 function Events.stop()
+    cancelActiveSwipeInertia(nil)
+
     -- stop events
     Events.PaperWM.window_filter:unsubscribeAll()
     for _, watcher in pairs(Events.PaperWM.state.ui_watchers) do watcher:stop() end
@@ -486,6 +809,11 @@ function Events.stop()
         timer:stop()
         pending_layout_timers[space] = nil
     end
+    for space, timer in pairs(pending_swipe_settles) do
+        timer:stop()
+        pending_swipe_settles[space] = nil
+    end
+    swipe_active_spaces = {}
     last_tile_times = {}
 
     -- stop listening for touchpad swipes

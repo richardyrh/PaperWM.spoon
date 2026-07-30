@@ -249,7 +249,31 @@ PaperWM.swipe_fingers = 0
 
 -- increase this number to make windows move farther when swiping
 PaperWM.swipe_gain = 1.0
+
+-- pixels of window travel between haptic ticks; set to 0 to disable
+PaperWM.swipe_haptic_interval = 120
+
+-- idle time before the post-swipe layout pass; rapid swipes cancel this timer
+PaperWM.swipe_settle_delay = 0.25
+
+-- continue moving with release velocity; lower friction coasts farther
+PaperWM.swipe_inertia = true
+PaperWM.swipe_inertia_friction = 3.5
+PaperWM.swipe_inertia_min_velocity = 40
+PaperWM.swipe_inertia_max_velocity = 6000
 ```
+
+Haptic feedback uses the system's current trackpad feedback performer. Ticks are
+based on accumulated horizontal travel, so longer swipes produce more feedback
+and faster swipes reach each tick sooner. macOS may suppress feedback when no
+haptic-capable trackpad is active or the trackpad is not being touched.
+
+Native swipes coast with the release velocity and stop at the first or last
+window without changing spacing within the strip. Layout snapping is deferred
+until the fingers, inertia, and settle delay have all finished. A swipe that
+starts during a native resize animation is ignored until that animation ends.
+Inspect `hs.inspect(PaperWM.events.swipeStatus())` in the Hammerspoon console
+to see the measured release velocity and any reason inertia was skipped.
 
 Inspired by [ScrollDesktop.spoon](https://github.com/jocap/ScrollDesktop.spoon)
 
