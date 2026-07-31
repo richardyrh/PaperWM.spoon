@@ -82,6 +82,27 @@ Config.swipe_fingers = 0 ---@type number
 ---increase this number to make windows move futher when swiping
 Config.swipe_gain = 1 ---@type number
 
+---accept horizontal RawXY from a passively observed Logitech gesture button
+Config.mouse_swipe = false ---@type boolean
+
+---multiplier for HID++ RawXY deltas
+Config.mouse_swipe_gain = 1 ---@type number
+
+---reverse horizontal HID++ gesture direction
+Config.mouse_swipe_invert = false ---@type boolean
+
+---accumulated RawXY travel before locking the gesture to an axis
+Config.mouse_swipe_direction_threshold = 1 ---@type number
+
+---receiver-local HID++ feature index observed for REPROG_CONTROLS_V4
+Config.mouse_swipe_hidpp_feature_index = 0x09 ---@type number
+
+---HID++ control ID for the MX Master 3 gesture button
+Config.mouse_swipe_hidpp_cid = 0x00c3 ---@type number
+
+---seconds between RawXY accumulator polls
+Config.mouse_swipe_poll_interval = 1 / 120 ---@type number
+
 ---distance in pixels between trackpad haptic ticks while swiping, set to 0 to disable
 Config.swipe_haptic_interval = 120 ---@type number
 

@@ -87,6 +87,14 @@ describe("PaperWM.swipe", function()
         end)
     end)
 
+    describe("directionLock", function()
+        it("waits for enough travel before selecting an axis", function()
+            assert.is_nil(Swipe.directionLock(5, 3, 12))
+            assert.is_true(Swipe.directionLock(15, 4, 12))
+            assert.is_false(Swipe.directionLock(4, 15, 12))
+        end)
+    end)
+
     describe("gesture lifecycle", function()
         it("ends on an empty fast lift and on full ended touch phases", function()
             local tap_callback

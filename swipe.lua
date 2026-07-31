@@ -79,6 +79,19 @@ function Swipe.clampStripDelta(delta, content_left, content_right,
     return 0
 end
 
+---lock an input stream to its dominant axis after sufficient travel
+---@param horizontal number accumulated absolute horizontal travel
+---@param vertical number accumulated absolute vertical travel
+---@param threshold number minimum accumulated travel before locking
+---@return boolean|nil horizontal
+function Swipe.directionLock(horizontal, vertical, threshold)
+    horizontal = math.max(0, tonumber(horizontal) or 0)
+    vertical = math.max(0, tonumber(vertical) or 0)
+    threshold = math.max(0, tonumber(threshold) or 0)
+    if horizontal + vertical < threshold then return nil end
+    return horizontal > vertical
+end
+
 
 local Cache = { id = nil, direction = nil, distance = 0, size = 0, touches = {} }
 

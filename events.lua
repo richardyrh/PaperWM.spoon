@@ -341,7 +341,7 @@ end
 ---@param initial_input_timestamp number|nil gesture begin timestamp in absolute nanoseconds
 ---@param initial_sample_timestamp number gesture begin callback time in absolute nanoseconds
 local function slide_windows(self, space, screen_frame, gesture_started,
-        initial_input_timestamp, initial_sample_timestamp)
+        initial_input_timestamp, initial_sample_timestamp, input_source)
     local left_margin  = screen_frame.x + self.screen_margin
     local right_margin = screen_frame.x2 - self.screen_margin
 
@@ -444,6 +444,11 @@ local function slide_windows(self, space, screen_frame, gesture_started,
     local release_sample_timestamp = nil
     while true do
         local dx, input_timestamp, sample_timestamp = coroutine.yield()
+        if dx == false then
+            releaseOwnership(false, false)
+            swipe_active_spaces[space] = nil
+            return
+        end
         if not dx then
             release_timestamp = input_timestamp
             release_sample_timestamp = sample_timestamp
@@ -475,6 +480,7 @@ local function slide_windows(self, space, screen_frame, gesture_started,
     velocity = math.max(-max_velocity, math.min(max_velocity, velocity))
     last_swipe_status = {
         space = space,
+        source = input_source or "unknown",
         release_velocity = velocity,
         velocity_samples = velocity_samples,
         release_age_ms = release_age * 1000,
@@ -551,6 +557,49 @@ local function slide_windows(self, space, screen_frame, gesture_started,
     releaseOwnership(true, true)
 end
 
+local function beginSlide(self, gesture_started, input_timestamp,
+        sample_timestamp, input_source)
+    local focused_window = Window.focusedWindow()
+    if not focused_window then
+        self.logger.d("focused window not found")
+        return nil, nil
+    end
+
+    local focused_index = self.state.index_table[focused_window:id()]
+    if not focused_index then
+        self.logger.e("focused index not found")
+        return nil, nil
+    end
+
+    local screen = Screen(Spaces.spaceDisplay(focused_index.space))
+    if not screen then
+        self.logger.e("no screen for space")
+        return nil, nil
+    end
+
+    cancelActiveSwipeInertia(focused_index.space)
+    cancelPendingLayout(focused_index.space)
+    cancelSwipeSettle(focused_index.space)
+
+    local screen_frame = screen:frame()
+    local swipe_coro = coroutine.wrap(slide_windows)
+    local start_status = swipe_coro(
+        self, focused_index.space, screen_frame, gesture_started,
+        input_timestamp, sample_timestamp, input_source)
+    if start_status == "blocked" then
+        last_swipe_status = {
+            space = focused_index.space,
+            source = input_source,
+            blocked = true,
+            inertia_started = false,
+            inertia_skipped = "native resize snap active",
+        }
+        return nil, nil
+    end
+    swipe_active_spaces[focused_index.space] = true
+    return swipe_coro, screen_frame
+end
+
 ---generate callback function for touchpad swipe gesture event
 ---@param self PaperWM
 function Events.swipeHandler(self)
@@ -580,50 +629,17 @@ function Events.swipeHandler(self)
                 swipe_id = nil
             end
 
-            -- use focused window for space to scroll windows
-            local focused_window = Window.focusedWindow()
-            if not focused_window then
-                self.logger.d("focused window not found")
-                return
-            end
-
-            local focused_index = self.state.index_table[focused_window:id()]
-            if not focused_index then
-                self.logger.e("focused index not found")
-                return
-            end
-
-            local screen = Screen(Spaces.spaceDisplay(focused_index.space))
-            if not screen then
-                self.logger.e("no screen for space")
-                return
-            end
-
-            cancelActiveSwipeInertia(focused_index.space)
-            cancelPendingLayout(focused_index.space)
-            cancelSwipeSettle(focused_index.space)
-
             -- cache upvalues
-            screen_frame = screen:frame()
             horizontal = nil
             haptic_distance = 0
-            swipe_coro = coroutine.wrap(slide_windows)
-            local start_status = swipe_coro(
-                self, focused_index.space, screen_frame, gesture_started,
-                input_timestamp, callback_timestamp)
-            if start_status == "blocked" then
-                last_swipe_status = {
-                    space = focused_index.space,
-                    blocked = true,
-                    inertia_started = false,
-                    inertia_skipped = "native resize snap active",
-                }
-                swipe_coro = nil
+            swipe_coro, screen_frame = beginSlide(
+                self, gesture_started, input_timestamp, callback_timestamp,
+                "trackpad")
+            if not swipe_coro then
                 swipe_id = nil
                 return
             end
             swipe_id = id
-            swipe_active_spaces[focused_index.space] = true
         elseif swipe_coro and swipe_id == id and type == Events.Swipe.END then
             self.logger.df("swipe end: %d", id)
             swipe_coro(nil, input_timestamp, callback_timestamp)
@@ -646,6 +662,84 @@ function Events.swipeHandler(self)
                 self.windows.performHapticFeedback()
             end
         end
+    end
+end
+
+
+---generate a poll callback for passive HID++ gesture-button RawXY
+---@param self PaperWM
+function Events.mouseSwipePoll(self)
+    local swipe_coro, horizontal = nil, nil
+    local horizontal_travel, vertical_travel, haptic_distance = 0, 0, 0
+    local pending_dx = 0
+    local gesture_started = nil
+
+    local function release(input_timestamp, sample_timestamp, cancel)
+        if swipe_coro then
+            swipe_coro(cancel and false or nil, input_timestamp, sample_timestamp)
+        end
+        swipe_coro, horizontal = nil, nil
+        horizontal_travel, vertical_travel, haptic_distance = 0, 0, 0
+        pending_dx, gesture_started = 0, nil
+    end
+
+    return function(stopping)
+        if stopping then
+            local timestamp = Timer.absoluteTime()
+            release(timestamp, timestamp, true)
+            return
+        end
+
+        local sample = self.windows.pollHIDPPGesture()
+        if not sample then return end
+
+        local sample_timestamp = Timer.absoluteTime()
+        if sample.began then
+            release(sample_timestamp, sample_timestamp)
+            gesture_started = sample_timestamp
+        end
+        if sample.active and not gesture_started then
+            gesture_started = sample_timestamp
+        end
+
+        local dx = tonumber(sample.dx) or 0
+        local dy = tonumber(sample.dy) or 0
+        if gesture_started and horizontal == nil and (dx ~= 0 or dy ~= 0) then
+            horizontal_travel = horizontal_travel + math.abs(dx)
+            vertical_travel = vertical_travel + math.abs(dy)
+            pending_dx = pending_dx + dx
+            horizontal = Events.Swipe.directionLock(
+                horizontal_travel, vertical_travel,
+                tonumber(self.mouse_swipe_direction_threshold) or 1)
+        elseif horizontal and not swipe_coro then
+            pending_dx = pending_dx + dx
+        end
+
+        if horizontal and not swipe_coro then
+            swipe_coro = beginSlide(
+                self, gesture_started, sample_timestamp, sample_timestamp,
+                "options-hidpp")
+            if swipe_coro then
+                dx, pending_dx = pending_dx, 0
+            end
+        end
+
+        if swipe_coro and dx ~= 0 then
+            local gain = tonumber(self.mouse_swipe_gain) or 1
+            if self.mouse_swipe_invert then gain = -gain end
+            dx = gain * dx
+            swipe_coro(dx, sample_timestamp, sample_timestamp)
+
+            local haptic_ticks
+            haptic_distance, haptic_ticks = Events.Swipe.distanceTicks(
+                haptic_distance, dx,
+                tonumber(self.swipe_haptic_interval) or 0)
+            for _ = 1, haptic_ticks do
+                self.windows.performHapticFeedback()
+            end
+        end
+
+        if sample.ended then release(sample_timestamp, sample_timestamp) end
     end
 end
 
@@ -790,6 +884,22 @@ function Events.start()
         Events.Swipe:start(Events.PaperWM.swipe_fingers, Events.swipeHandler(Events.PaperWM))
     end
 
+    if Events.PaperWM.mouse_swipe then
+        local started, reason = Events.PaperWM.windows.startHIDPPGestureMonitor(
+            tonumber(Events.PaperWM.mouse_swipe_hidpp_feature_index) or 0x09,
+            tonumber(Events.PaperWM.mouse_swipe_hidpp_cid) or 0x00c3)
+        if started then
+            Events.mouse_swipe_poll = Events.mouseSwipePoll(Events.PaperWM)
+            Events.mouse_swipe_timer = Timer.new(
+                tonumber(Events.PaperWM.mouse_swipe_poll_interval) or (1 / 120),
+                Events.mouse_swipe_poll):start()
+        else
+            Events.PaperWM.logger.wf(
+                "could not start passive HID++ gesture monitor: %s",
+                tostring(reason))
+        end
+    end
+
     -- register a mouse event watcher if the drag window or lift window hotkeys are set
     if Events.PaperWM.drag_window or Events.PaperWM.lift_window then
         Events.mouse_watcher = hs.eventtap.new({ LeftMouseDown, LeftMouseDragged, LeftMouseUp },
@@ -818,6 +928,14 @@ function Events.stop()
 
     -- stop listening for touchpad swipes
     Events.Swipe:stop()
+
+    if Events.mouse_swipe_timer then
+        if Events.mouse_swipe_poll then Events.mouse_swipe_poll(true) end
+        Events.mouse_swipe_timer:stop()
+        Events.mouse_swipe_timer = nil
+        Events.mouse_swipe_poll = nil
+    end
+    Events.PaperWM.windows.stopHIDPPGestureMonitor()
 
     -- stop listening for mouse events
     if Events.mouse_watcher then Events.mouse_watcher:stop() end

@@ -833,6 +833,47 @@ function Windows.performHapticFeedback()
     return false, native_haptic_error
 end
 
+---start passive HID++ gesture-button and RawXY observation
+---@param feature_index number
+---@param cid number
+---@return boolean
+---@return string|nil
+function Windows.startHIDPPGestureMonitor(feature_index, cid)
+    local helper = loadNativeHelper()
+    if not helper or type(helper.hidppMonitorStart) ~= "function" then
+        return false, native_helper_error or
+            "native helper was built without HID++ monitor support"
+    end
+
+    local called, started, reason = pcall(
+        helper.hidppMonitorStart, feature_index, cid)
+    if not called then return false, started end
+    return started == true, reason
+end
+
+---return and clear HID++ RawXY accumulated since the previous poll
+---@return table|nil
+---@return string|nil
+function Windows.pollHIDPPGesture()
+    local helper = loadNativeHelper()
+    if not helper or type(helper.hidppMonitorPoll) ~= "function" then
+        return nil, native_helper_error or
+            "native helper was built without HID++ monitor support"
+    end
+
+    local called, sample, reason = pcall(helper.hidppMonitorPoll)
+    if not called then return nil, sample end
+    return sample, reason
+end
+
+---stop passive HID++ observation
+function Windows.stopHIDPPGestureMonitor()
+    local helper = loadNativeHelper()
+    if helper and type(helper.hidppMonitorStop) == "function" then
+        pcall(helper.hidppMonitorStop)
+    end
+end
+
 ---return timing from the most recently completed compositor gesture
 ---@return table|nil
 function Windows.interactiveLatencyStatus()
@@ -872,10 +913,15 @@ function Windows.beginInteractiveMove(items, gesture_started)
         if can_resume then
             for _, item in ipairs(items) do
                 local record = interactive_moves[item.window:id()]
+                -- item.x comes from x_positions and is the authoritative
+                -- virtual canvas coordinate. A distant window's retained
+                -- WindowServer frame may be parked at the screen edge, so
+                -- copying record.end_frame.x back into item.x can collapse
+                -- several off-canvas columns onto the same edge position.
                 item.frame = hs.geometry.rect(
-                    record.end_frame.x, record.end_frame.y,
+                    item.x, record.end_frame.y,
                     record.end_frame.w, record.end_frame.h)
-                item.x = record.end_frame.x
+                record.end_frame.x = item.x
             end
             if interactive_profile then
                 interactive_profile.resume_count =

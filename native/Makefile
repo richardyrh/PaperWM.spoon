@@ -13,6 +13,7 @@ $(TARGET): $(SOURCE)
 		-I"$(LUA_HEADERS)" \
 		-framework ApplicationServices \
 		-framework AppKit \
+		-framework IOKit \
 		-o "$@" "$<"
 
 clean:

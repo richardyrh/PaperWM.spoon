@@ -1,4 +1,6 @@
 #include <ApplicationServices/ApplicationServices.h>
+#include <IOKit/hid/IOHIDKeys.h>
+#include <IOKit/hid/IOHIDManager.h>
 #import <AppKit/NSHapticFeedback.h>
 #include <dlfcn.h>
 #include <math.h>
@@ -48,7 +50,235 @@ static CGSReenableUpdateFn reenableUpdate = NULL;
 static CGSMoveWindowFn moveWindow = NULL;
 static const char *loadError = NULL;
 
+#define HIDPP_LONG_REPORT 0x11
+#define HIDPP_SHORT_REPORT 0x10
+#define HIDPP_MAX_DEVICES 8
+#define HIDPP_REPORT_SIZE 64
+
+typedef struct {
+    IOHIDDeviceRef device;
+    uint8_t buffer[HIDPP_REPORT_SIZE];
+} HIDPPDevice;
+
+static IOHIDManagerRef hidppManager = NULL;
+static HIDPPDevice hidppDevices[HIDPP_MAX_DEVICES];
+static uint8_t hidppFeatureIndex = 0x09;
+static uint16_t hidppGestureCID = 0x00c3;
+static HIDPPDevice *hidppGestureSource = NULL;
+static uint8_t hidppGestureDeviceIndex = 0;
+static bool hidppGestureDown = false;
+static bool hidppGestureBegan = false;
+static bool hidppGestureEnded = false;
+static bool hidppDiscardNextRaw = false;
+static int32_t hidppAccumulatedX = 0;
+static int32_t hidppAccumulatedY = 0;
+
 static int pushCGError(lua_State *L, CGError error);
+
+static void hidppInputReport(void *context,
+                             IOReturn result,
+                             void *sender,
+                             IOHIDReportType type,
+                             uint32_t reportID,
+                             uint8_t *report,
+                             CFIndex length) {
+    (void)sender;
+    (void)type;
+    (void)reportID;
+    if (result != kIOReturnSuccess || length < 6) return;
+    if (report[0] != HIDPP_LONG_REPORT && report[0] != HIDPP_SHORT_REPORT) return;
+    if (report[2] != hidppFeatureIndex) return;
+
+    if (report[3] == 0x00) {
+        uint16_t cid = ((uint16_t)report[4] << 8) | report[5];
+        if (cid == hidppGestureCID && !hidppGestureDown) {
+            hidppGestureSource = context;
+            hidppGestureDeviceIndex = report[1];
+            hidppGestureDown = true;
+            hidppGestureBegan = true;
+            hidppGestureEnded = false;
+            hidppDiscardNextRaw = true;
+            hidppAccumulatedX = 0;
+            hidppAccumulatedY = 0;
+        } else if (cid == 0 && hidppGestureDown &&
+                   context == hidppGestureSource &&
+                   report[1] == hidppGestureDeviceIndex) {
+            hidppGestureDown = false;
+            hidppGestureEnded = true;
+            hidppDiscardNextRaw = false;
+        }
+        return;
+    }
+
+    if ((report[3] & 0xf0) == 0x10 && hidppGestureDown && length >= 8 &&
+        context == hidppGestureSource &&
+        report[1] == hidppGestureDeviceIndex) {
+        int16_t dx = (int16_t)(((uint16_t)report[4] << 8) | report[5]);
+        int16_t dy = (int16_t)(((uint16_t)report[6] << 8) | report[7]);
+        if (hidppDiscardNextRaw) {
+            hidppDiscardNextRaw = false;
+        } else {
+            hidppAccumulatedX += dx;
+            hidppAccumulatedY += dy;
+        }
+    }
+}
+
+static void hidppDeviceMatched(void *context,
+                               IOReturn result,
+                               void *sender,
+                               IOHIDDeviceRef device) {
+    (void)context;
+    (void)sender;
+    if (result != kIOReturnSuccess) return;
+
+    for (int i = 0; i < HIDPP_MAX_DEVICES; i++) {
+        if (hidppDevices[i].device == device) return;
+    }
+    for (int i = 0; i < HIDPP_MAX_DEVICES; i++) {
+        if (hidppDevices[i].device) continue;
+        if (IOHIDDeviceOpen(device, kIOHIDOptionsTypeNone) != kIOReturnSuccess) return;
+
+        hidppDevices[i].device = device;
+        IOHIDDeviceRegisterInputReportCallback(
+            device, hidppDevices[i].buffer, sizeof(hidppDevices[i].buffer),
+            hidppInputReport, &hidppDevices[i]);
+        IOHIDDeviceScheduleWithRunLoop(
+            device, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
+        return;
+    }
+}
+
+static void hidppDeviceRemoved(void *context,
+                               IOReturn result,
+                               void *sender,
+                               IOHIDDeviceRef device) {
+    (void)context;
+    (void)result;
+    (void)sender;
+    for (int i = 0; i < HIDPP_MAX_DEVICES; i++) {
+        if (hidppDevices[i].device != device) continue;
+        IOHIDDeviceUnscheduleFromRunLoop(
+            device, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
+        IOHIDDeviceClose(device, kIOHIDOptionsTypeNone);
+        if (&hidppDevices[i] == hidppGestureSource) {
+            if (hidppGestureDown) hidppGestureEnded = true;
+            hidppGestureDown = false;
+            hidppGestureSource = NULL;
+            hidppGestureDeviceIndex = 0;
+        }
+        hidppDevices[i].device = NULL;
+        return;
+    }
+}
+
+static int hidppMonitorStart(lua_State *L) {
+    hidppFeatureIndex = (uint8_t)luaL_optinteger(L, 1, 0x09);
+    hidppGestureCID = (uint16_t)luaL_optinteger(L, 2, 0x00c3);
+    hidppGestureDown = false;
+    hidppGestureSource = NULL;
+    hidppGestureDeviceIndex = 0;
+    hidppGestureBegan = false;
+    hidppGestureEnded = false;
+    hidppDiscardNextRaw = false;
+    hidppAccumulatedX = 0;
+    hidppAccumulatedY = 0;
+    if (hidppManager) {
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+
+    hidppManager = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
+    if (!hidppManager) {
+        lua_pushnil(L);
+        lua_pushstring(L, "could not create IOHIDManager");
+        return 2;
+    }
+
+    @autoreleasepool {
+        NSDictionary *matching = @{
+            @kIOHIDVendorIDKey: @0x046d,
+            @kIOHIDPrimaryUsagePageKey: @0xff00,
+        };
+        IOHIDManagerSetDeviceMatching(
+            hidppManager, (__bridge CFDictionaryRef)matching);
+    }
+    IOHIDManagerRegisterDeviceMatchingCallback(
+        hidppManager, hidppDeviceMatched, NULL);
+    IOHIDManagerRegisterDeviceRemovalCallback(
+        hidppManager, hidppDeviceRemoved, NULL);
+    IOHIDManagerScheduleWithRunLoop(
+        hidppManager, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
+
+    IOReturn opened = IOHIDManagerOpen(hidppManager, kIOHIDOptionsTypeNone);
+    if (opened != kIOReturnSuccess) {
+        IOHIDManagerUnscheduleFromRunLoop(
+            hidppManager, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
+        CFRelease(hidppManager);
+        hidppManager = NULL;
+        lua_pushnil(L);
+        lua_pushfstring(L, "could not open IOHIDManager: 0x%x", opened);
+        return 2;
+    }
+
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int hidppMonitorPoll(lua_State *L) {
+    if (!hidppManager) {
+        lua_pushnil(L);
+        lua_pushstring(L, "HID++ gesture monitor is not running");
+        return 2;
+    }
+
+    lua_createtable(L, 0, 5);
+    lua_pushboolean(L, hidppGestureDown);
+    lua_setfield(L, -2, "active");
+    lua_pushboolean(L, hidppGestureBegan);
+    lua_setfield(L, -2, "began");
+    lua_pushboolean(L, hidppGestureEnded);
+    lua_setfield(L, -2, "ended");
+    lua_pushinteger(L, hidppAccumulatedX);
+    lua_setfield(L, -2, "dx");
+    lua_pushinteger(L, hidppAccumulatedY);
+    lua_setfield(L, -2, "dy");
+
+    hidppGestureBegan = false;
+    hidppGestureEnded = false;
+    hidppAccumulatedX = 0;
+    hidppAccumulatedY = 0;
+    return 1;
+}
+
+static int hidppMonitorStop(lua_State *L) {
+    (void)L;
+    if (hidppManager) {
+        for (int i = 0; i < HIDPP_MAX_DEVICES; i++) {
+            IOHIDDeviceRef device = hidppDevices[i].device;
+            if (!device) continue;
+            IOHIDDeviceUnscheduleFromRunLoop(
+                device, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
+            IOHIDDeviceClose(device, kIOHIDOptionsTypeNone);
+            hidppDevices[i].device = NULL;
+        }
+        IOHIDManagerUnscheduleFromRunLoop(
+            hidppManager, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
+        IOHIDManagerClose(hidppManager, kIOHIDOptionsTypeNone);
+        CFRelease(hidppManager);
+        hidppManager = NULL;
+    }
+    hidppGestureDown = false;
+    hidppGestureSource = NULL;
+    hidppGestureDeviceIndex = 0;
+    hidppGestureBegan = false;
+    hidppGestureEnded = false;
+    hidppDiscardNextRaw = false;
+    hidppAccumulatedX = 0;
+    hidppAccumulatedY = 0;
+    lua_pushboolean(L, 1);
+    return 1;
+}
 
 static bool loadSkyLight(void) {
     if (skyLight) return true;
@@ -579,6 +809,9 @@ static const luaL_Reg transformFunctions[] = {
     {"endUpdates", transformEndUpdates},
     {"hapticAvailable", hapticAvailable},
     {"haptic", hapticPerform},
+    {"hidppMonitorStart", hidppMonitorStart},
+    {"hidppMonitorPoll", hidppMonitorPoll},
+    {"hidppMonitorStop", hidppMonitorStop},
     {NULL, NULL},
 };
 

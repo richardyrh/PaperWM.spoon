@@ -1,5 +1,9 @@
 ---@diagnostic disable
 
+local native_bounds = {}
+local native_transforms = {}
+local original_loadlib = package.loadlib
+
 package.preload["windows"] = function()
     _G.hs = {
         spaces = {
@@ -44,7 +48,42 @@ package.preload["windows"] = function()
         settings = {
             set = function(_, _) end,
         },
+        spoons = {
+            resourcePath = function(path) return "mock/" .. path end,
+        },
+        timer = {
+            absoluteTime = function() return 0 end,
+            secondsSinceEpoch = function() return 0 end,
+        },
     }
+
+    package.loadlib = function(path, symbol)
+        if path == "mock/native/paperwm_transform.so" and
+            symbol == "luaopen_paperwm_transform" then
+            return function()
+                return {
+                    available = function() return true end,
+                    bounds = function(ids)
+                        local frames = {}
+                        for _, id in ipairs(ids) do
+                            table.insert(frames, native_bounds[id])
+                        end
+                        return frames
+                    end,
+                    setAtomic = function(transforms)
+                        native_transforms = transforms
+                        return true
+                    end,
+                    move = function() return true end,
+                    set = function() return true end,
+                    beginUpdates = function() return true end,
+                    endUpdates = function() return true end,
+                }
+            end
+        end
+        return original_loadlib(path, symbol)
+    end
+
     return dofile("windows.lua")
 end
 
@@ -96,11 +135,14 @@ describe("PaperWM.windows", function()
         window_filter = {
             getWindows = function() return {} end,
         },
+        animation_backend = "none",
         logger = {
             d = function(...) end,
             e = function(...) end,
             v = function(...) end,
             df = function(...) end,
+            ef = function(...) end,
+            wf = function(...) end,
         },
         tileSpace = function() end,
         window_gap = 8,
@@ -115,8 +157,44 @@ describe("PaperWM.windows", function()
         State.ui_watchers = {}
         State.is_floating = {}
         State.x_positions = {}
+        mock_paperwm.animation_backend = "none"
+        native_bounds = {}
+        native_transforms = {}
         Windows.init(mock_paperwm)
         hs.window.focusedWindow = function() return focused_window end
+    end)
+
+    describe("beginInteractiveMove", function()
+        it("preserves virtual positions when resuming retained transforms", function()
+            local win1 = mock_window(101, "Visible")
+            local win2 = mock_window(102, "Distant")
+            native_bounds[101] = { id = 101, x = 100, y = 0, w = 100, h = 100 }
+            -- PaperWM parks distant real windows at the edge while retaining a
+            -- distinct virtual position farther down the canvas.
+            native_bounds[102] = { id = 102, x = 900, y = 0, w = 100, h = 100 }
+            mock_paperwm.animation_backend = "native"
+
+            local started = Windows.beginInteractiveMove({
+                { window = win1, x = 100 },
+                { window = win2, x = 1800 },
+            })
+            assert.is_true(started)
+
+            local resumed = {
+                { window = win1, x = 100 },
+                { window = win2, x = 1800 },
+            }
+            local active = Windows.beginInteractiveMove(resumed)
+
+            assert.is_true(active)
+            assert.are.equal(100, resumed[1].frame.x)
+            assert.are.equal(1800, resumed[2].frame.x)
+            assert.are.equal(1800, resumed[2].x)
+
+            assert.is_true(Windows.updateInteractiveMove(resumed))
+            assert.are.equal(900, native_transforms[2].tx)
+            Windows.endInteractiveMove()
+        end)
     end)
 
     describe("addWindow", function()

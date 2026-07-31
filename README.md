@@ -261,7 +261,21 @@ PaperWM.swipe_inertia = true
 PaperWM.swipe_inertia_friction = 3.5
 PaperWM.swipe_inertia_min_velocity = 40
 PaperWM.swipe_inertia_max_velocity = 6000
+
+-- Optional: use passive HID++ RawXY from an MX Master gesture button.
+PaperWM.mouse_swipe = true
+PaperWM.mouse_swipe_gain = 1
+PaperWM.mouse_swipe_invert = false
+PaperWM.mouse_swipe_hidpp_feature_index = 0x09
+PaperWM.mouse_swipe_hidpp_cid = 0x00c3
 ```
+
+For an MX Master 3, configure the Options+ gesture button as **Custom**, set
+left and right to **Do Nothing**, and keep up assigned to Mission Control.
+`mouse_swipe` observes the gesture button and RawXY reports without changing
+the receiver's diversion settings. Horizontal thumb-wheel and trackpad scroll
+events are not intercepted. The feature index and CID are device-specific
+values obtained from a passive receiver probe.
 
 Haptic feedback uses the system's current trackpad feedback performer. Ticks are
 based on accumulated horizontal travel, so longer swipes produce more feedback
