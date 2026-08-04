@@ -32,6 +32,11 @@ function Space.tileSpace(space)
         return
     end
 
+    -- Removing the final managed window still schedules one last layout pass.
+    -- An empty Space is therefore an expected no-op, not a missing anchor.
+    local columns = Space.PaperWM.state.window_list[space]
+    if not columns or #columns == 0 then return end
+
     -- find screen for space
     local screen = Screen(Spaces.spaceDisplay(space))
     if not screen then

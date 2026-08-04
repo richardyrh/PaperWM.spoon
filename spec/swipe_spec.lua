@@ -11,6 +11,7 @@ _G.hs = {
     math = {
         randomFromRange = function() return 123 end,
     },
+    timer = {},
 }
 
 describe("PaperWM.swipe", function()
@@ -96,11 +97,22 @@ describe("PaperWM.swipe", function()
     end)
 
     describe("gesture lifecycle", function()
-        it("ends on an empty fast lift and on full ended touch phases", function()
+        it("debounces empty packets and ends on a sustained empty lift", function()
             local tap_callback
+            local pending_end
             hs.eventtap.new = function(_, callback)
                 tap_callback = callback
                 return { start = function() end, stop = function() end }
+            end
+            hs.timer.doAfter = function(_, callback)
+                pending_end = {
+                    stopped = false,
+                    stop = function(self) self.stopped = true end,
+                    fire = function(self)
+                        if not self.stopped then callback() end
+                    end,
+                }
+                return pending_end
             end
 
             local calls = {}
@@ -124,6 +136,16 @@ describe("PaperWM.swipe", function()
                 touch(1, "began"), touch(2, "began"), touch(3, "began"),
             }))
             tap_callback(event({}))
+            assert.are.same({ Swipe.BEGIN }, calls)
+            local transient_empty = pending_end
+            tap_callback(event({
+                touch(1, "stationary"), touch(2, "stationary"),
+                touch(3, "stationary"),
+            }))
+            assert.is_true(transient_empty.stopped)
+
+            tap_callback(event({}))
+            pending_end:fire()
             assert.are.same({ Swipe.BEGIN, Swipe.END }, calls)
 
             tap_callback(event({

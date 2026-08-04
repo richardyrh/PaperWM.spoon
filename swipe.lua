@@ -190,6 +190,22 @@ function Swipe:start(fingers, callback)
                 #touches, table.concat(phases, ","), tostring(event:timestamp()))
         end
 
+        if #touches == 0 and Cache.id then
+            local id, timestamp = Cache.id, event:timestamp()
+            if self.pending_end then self.pending_end:stop() end
+            self.pending_end = hs.timer.doAfter(0.05, function()
+                self.pending_end = nil
+                if Cache.id ~= id then return end
+                callback(id, Swipe.END, 0, 0, timestamp)
+                Cache:clear()
+            end)
+            return
+        end
+        if self.pending_end then
+            self.pending_end:stop()
+            self.pending_end = nil
+        end
+
         local terminal_phase = false
         for _, touch in ipairs(touches) do
             if touch.phase == "ended" or touch.phase == "cancelled" then
@@ -223,6 +239,10 @@ function Swipe:start(fingers, callback)
 end
 
 function Swipe:stop()
+    if self.pending_end then
+        self.pending_end:stop()
+        self.pending_end = nil
+    end
     if self.watcher then
         self.watcher:stop()
         self.watcher = nil

@@ -19,6 +19,7 @@ Events.__index = Events
 -- windowsChanged back-to-back. Tile once after that burst instead of starting
 -- and replacing several animations in the same run-loop turn.
 local pending_layout_timers = {}
+local pending_window_timers = {}
 local swipe_active_spaces = {}
 local layout_debounce <const> = 0.015
 
@@ -42,6 +43,34 @@ local function tileImmediately(self, space)
         pending_layout_timers[space] = nil
     end
     self.space.tileSpace(space)
+end
+
+local function cancelPendingWindow(id)
+    local timer = pending_window_timers[id]
+    if timer then timer:stop() end
+    pending_window_timers[id] = nil
+end
+
+local function schedulePendingWindow(self, window)
+    local id = window:id()
+    if pending_window_timers[id] then return end
+
+    local timer
+    timer = Timer.doAfter(Window.animationDuration, function()
+        if pending_window_timers[id] ~= timer then return end
+        pending_window_timers[id] = nil
+        if self.state.index_table[id] then return end
+
+        -- A transient window may disappear before its Space assignment
+        -- catches up. Treat a stale AX object like a cancelled retry.
+        local ok, space = pcall(self.windows.addWindow, window)
+        if ok and space then
+            scheduleTile(self, space)
+        elseif not ok then
+            self.logger.df("window %d disappeared before Space assignment: %s", id, space)
+        end
+    end)
+    pending_window_timers[id] = timer
 end
 
 -- A live mouse resize/move emits a flood of AX events. Reflowing the whole
@@ -87,10 +116,24 @@ local pending_swipe_settles = {}
 local active_swipe_inertia = nil
 local last_swipe_status = nil
 local default_swipe_settle_delay <const> = 0.25
-local swipe_inertia_interval <const> = 1 / 60
+local default_swipe_inertia_fps <const> = 120
 local swipe_velocity_response <const> = 0.025
 local swipe_release_max_age <const> = 0.2
 local swipe_trace_path <const> = "/tmp/paperwm_swipe_trace.log"
+local diagnostics_trace_path <const> = "/tmp/paperwm_diagnostics.log"
+local diagnostics_trace_file = nil
+
+local function traceDiagnostic(self, format, ...)
+    if not self.diagnostics_trace or not diagnostics_trace_file then return end
+    diagnostics_trace_file:write(string.format("%.6f ", Timer.secondsSinceEpoch()))
+    diagnostics_trace_file:write(string.format(format, ...))
+    diagnostics_trace_file:write("\n")
+end
+
+---append a compact diagnostic record from another PaperWM module
+function Events.trace(format, ...)
+    if Events.PaperWM then traceDiagnostic(Events.PaperWM, format, ...) end
+end
 
 local function traceSwipe(self, format, ...)
     if not self.swipe_debug_trace then return end
@@ -100,6 +143,18 @@ local function traceSwipe(self, format, ...)
     file:write(string.format(format, ...))
     file:write("\n")
     file:close()
+end
+
+local function traceSwipeStatus(self, phase)
+    local status = last_swipe_status
+    if not status then return end
+    traceDiagnostic(self,
+        "swipe phase=%s source=%s space=%s compositor=%s velocity=%.3f samples=%d age_ms=%.3f inertia_started=%s inertia_finished=%s skipped=%s",
+        tostring(phase), tostring(status.source), tostring(status.space),
+        tostring(status.compositor_active), status.release_velocity or 0,
+        status.velocity_samples or 0, status.release_age_ms or 0,
+        tostring(status.inertia_started), tostring(status.inertia_finished),
+        tostring(status.inertia_skipped))
 end
 
 local function startSpaceWatchers(self, space)
@@ -118,6 +173,7 @@ local function cancelActiveSwipeInertia(next_space)
     active_swipe_inertia = nil
     inertia.timer:stop()
     if last_swipe_status then last_swipe_status.inertia_interrupted = true end
+    traceSwipeStatus(Events.PaperWM, "interrupted")
     local preserve_transform = next_space == inertia.space
     inertia.release(preserve_transform, false)
     if not preserve_transform then swipe_active_spaces[inertia.space] = nil end
@@ -213,13 +269,16 @@ end)())
 ---@param self PaperWM
 function Events.windowEventHandler(window, event, self)
     if not window["id"] then
-        self.logger.ef("no id method for window %s in windowEventHandler", window)
+        self.logger.df("ignoring %s event without a window id: %s", event, window)
         return
     end
 
     -- Avoid synchronously asking the owning application for its title in the
     -- hot event path; a hung app can otherwise delay every window event.
     self.logger.df("%s for window id: %d", event, window:id())
+    if event == "windowFocused" then
+        self.windows.noteKeyboardFocusEvent(window)
+    end
     -- hs.printf("%s for [%s] id: %d", event, window, window:id() or -1)
     local space = nil
     local tile_immediately = false
@@ -229,14 +288,6 @@ function Events.windowEventHandler(window, event, self)
         self.windows.redirectTransientFocus(window) then
         return
     end
-
-    --[[ When a new window is created, We first get a windowVisible event but
-    without a Space. Next we receive a windowFocused event for the window, but
-    this also sometimes lacks a Space. Our approach is to store the window
-    pending a Space in the pending_window variable and set a timer to try to add
-    the window again later. Also schedule the windowFocused handler to run later
-    after the window was added ]]
-    --
 
     if self.state.is_floating[window:id()] then
         -- this event is only meaningful for floating windows
@@ -249,33 +300,29 @@ function Events.windowEventHandler(window, event, self)
     end
 
     if event == "windowFocused" then
-        if self.state.pending_window and window == self.state.pending_window then
-            Timer.doAfter(Window.animationDuration,
-                function()
-                    self.logger.vf("pending window timer for %s", window)
-                    Events.windowEventHandler(window, event, self)
-                end)
-            return
-        end
+        local index = self.state.index_table[window:id()]
+        if not index then return end
         self.state.prev_focused_window = window -- for addWindow()
-        space = Spaces.windowSpaces(window)[1]
+        space = index.space
         tile_immediately = true
     elseif event == "windowVisible" or event == "windowUnfullscreened" then
         space = self.windows.addWindow(window)
-        if self.state.pending_window and window == self.state.pending_window then
-            self.state.pending_window = nil -- tried to add window for the second time
-        elseif not space then
-            self.state.pending_window = window
-            Timer.doAfter(Window.animationDuration,
-                function()
-                    Events.windowEventHandler(window, event, self)
-                end)
+        if space then
+            cancelPendingWindow(window:id())
+        else
+            schedulePendingWindow(self, window)
             return
         end
-    elseif event == "windowNotVisible" then -- or event == "windowHidden" then
-        space = self.windows.removeWindow(window)
+    elseif event == "windowNotVisible" or event == "windowDestroyed" then
+        cancelPendingWindow(window:id())
+        if self.state.index_table[window:id()] then
+            space = self.windows.removeWindow(window)
+        end
     elseif event == "windowFullscreened" then -- or event == "windowNotInCurrentSpace" then
-        space = self.windows.removeWindow(window, true) -- don't focus new window if fullscreened
+        cancelPendingWindow(window:id())
+        if self.state.index_table[window:id()] then
+            space = self.windows.removeWindow(window, true) -- don't focus new window if fullscreened
+        end
     elseif event == "AXWindowMoved" or event == "AXWindowResized" then
         -- This runs on every frame of a live drag/resize, so avoid the slow
         -- private-API space lookup and use the cached space when available.
@@ -327,6 +374,7 @@ function Events.windowEventHandler(window, event, self)
             throttleTile(self, space)
         elseif tile_immediately then
             tileImmediately(self, space)
+            self.windows.noteKeyboardLayoutComplete(window)
         else
             scheduleTile(self, space)
         end
@@ -392,12 +440,10 @@ local function slide_windows(self, space, screen_frame, gesture_started,
         moved = true
         for _, item in ipairs(windows) do
             item.x = item.x + dx
-            -- Presentation transforms can move fully off-screen, so keep
-            -- the native strip rigid. Per-window edge clamping makes a
-            -- trailing window stop while its neighbors keep moving.
-            item.frame.x = compositor_active and item.x or
-                (dx > 0 and math.min(item.x, right_margin) or
-                    math.max(item.x, left_margin - item.frame.w))
+            -- Keep virtual strip positions unconstrained, but park real
+            -- windows at this screen's edges just like normal tiling does.
+            item.frame.x = math.max(left_margin - item.frame.w,
+                math.min(item.x, right_margin))
         end
         if compositor_active then
             local updated, reason =
@@ -499,6 +545,7 @@ local function slide_windows(self, space, screen_frame, gesture_started,
         local friction = math.max(0.01,
             tonumber(self.swipe_inertia_friction) or 3.5)
         last_swipe_status.inertia_started = true
+        traceSwipeStatus(self, "release")
         traceSwipe(self, "inertia start velocity=%.3f friction=%.3f", velocity, friction)
         local last_tick = Timer.secondsSinceEpoch()
         local inertia = { space = space }
@@ -508,7 +555,12 @@ local function slide_windows(self, space, screen_frame, gesture_started,
             releaseOwnership(preserve_transform, settle)
         end
 
-        inertia.timer = Timer.new(swipe_inertia_interval, function()
+        local inertia_fps = tonumber(self.animation_fps) or
+            default_swipe_inertia_fps
+        if inertia_fps <= 0 or inertia_fps ~= inertia_fps then
+            inertia_fps = default_swipe_inertia_fps
+        end
+        inertia.timer = Timer.new(1 / inertia_fps, function()
             local now = Timer.secondsSinceEpoch()
             local elapsed = math.max(0, math.min(0.05, now - last_tick))
             last_tick = now
@@ -535,6 +587,7 @@ local function slide_windows(self, space, screen_frame, gesture_started,
                 traceSwipe(self, "inertia finish ticks=%d velocity=%.3f",
                     inertia_ticks, velocity)
                 inertia.release(true, true)
+                traceSwipeStatus(self, "finished")
             end
         end)
         active_swipe_inertia = inertia
@@ -553,6 +606,7 @@ local function slide_windows(self, space, screen_frame, gesture_started,
     end
     traceSwipe(self, "inertia skipped reason=%s",
         tostring(last_swipe_status.inertia_skipped))
+    traceSwipeStatus(self, "skipped")
 
     releaseOwnership(true, true)
 end
@@ -594,6 +648,7 @@ local function beginSlide(self, gesture_started, input_timestamp,
             inertia_started = false,
             inertia_skipped = "native resize snap active",
         }
+        traceSwipeStatus(self, "blocked")
         return nil, nil
     end
     swipe_active_spaces[focused_index.space] = true
@@ -605,7 +660,9 @@ end
 function Events.swipeHandler(self)
     -- saved upvalues between callback function calls
     local swipe_coro, swipe_id, screen_frame, horizontal = nil, nil, nil, nil
+    local horizontal_travel, vertical_travel, pending_dx = 0, 0, 0
     local haptic_distance = 0
+    local gesture_started, begin_input_timestamp, begin_sample_timestamp
 
     ---callback for touchpad swipe gesture event
     ---@param id number unique id across callbacks for the same swipe
@@ -619,38 +676,63 @@ function Events.swipeHandler(self)
             tostring(id), tostring(type), dx, dy, tostring(input_timestamp),
             tostring(callback_timestamp))
         if type == Events.Swipe.BEGIN then
-            local gesture_started = callback_timestamp
-
             -- Defensively close a recognizer lifecycle that did not deliver
-            -- END before a replacement gesture.
+            -- END before a replacement gesture. Do not acquire the new slide
+            -- yet: macOS can emit zero-movement gesture fragments during a
+            -- lift, and beginning one here would immediately cancel coasting.
             if swipe_coro then
                 swipe_coro(nil, input_timestamp, callback_timestamp)
                 swipe_coro = nil
-                swipe_id = nil
             end
 
             -- cache upvalues
-            horizontal = nil
-            haptic_distance = 0
-            swipe_coro, screen_frame = beginSlide(
-                self, gesture_started, input_timestamp, callback_timestamp,
-                "trackpad")
-            if not swipe_coro then
-                swipe_id = nil
-                return
-            end
             swipe_id = id
-        elseif swipe_coro and swipe_id == id and type == Events.Swipe.END then
-            self.logger.df("swipe end: %d", id)
-            swipe_coro(nil, input_timestamp, callback_timestamp)
+            screen_frame = nil
+            horizontal = nil
+            horizontal_travel, vertical_travel, pending_dx = 0, 0, 0
+            haptic_distance = 0
+            gesture_started = callback_timestamp
+            begin_input_timestamp = input_timestamp
+            begin_sample_timestamp = callback_timestamp
+        elseif swipe_id == id and type == Events.Swipe.END then
+            if swipe_coro then
+                self.logger.df("swipe end: %d", id)
+                swipe_coro(nil, input_timestamp, callback_timestamp)
+            else
+                traceSwipe(self,
+                    "candidate end ignored id=%s reason=no horizontal movement",
+                    tostring(id))
+            end
             swipe_coro = nil
             swipe_id = nil
-        elseif swipe_coro and swipe_id == id and screen_frame and
-            type == Events.Swipe.MOVED then
-            if horizontal == nil and (dx ~= 0 or dy ~= 0) then
-                horizontal = math.abs(dx) > math.abs(dy)
+            screen_frame = nil
+            gesture_started = nil
+            begin_input_timestamp = nil
+            begin_sample_timestamp = nil
+        elseif swipe_id == id and type == Events.Swipe.MOVED then
+            if horizontal == nil then
+                horizontal_travel = horizontal_travel + math.abs(dx)
+                vertical_travel = vertical_travel + math.abs(dy)
+                pending_dx = pending_dx + dx
+                local direction = Events.Swipe.directionLock(
+                    horizontal_travel, vertical_travel,
+                    tonumber(self.swipe_direction_threshold) or 0.01)
+                if direction ~= true then return end
+                horizontal = true
+                dx, pending_dx = pending_dx, 0
+
+                -- Only meaningful horizontal input takes ownership from an
+                -- active coast. This makes terminal touch fragments harmless
+                -- while preserving intentional swipe-to-interrupt behavior.
+                swipe_coro, screen_frame = beginSlide(
+                    self, gesture_started, begin_input_timestamp,
+                    begin_sample_timestamp, "trackpad")
+                if not swipe_coro then
+                    swipe_id = nil
+                    return
+                end
             end
-            if not horizontal then return end
+            if not horizontal or not swipe_coro or not screen_frame then return end
             dx = self.swipe_gain * dx * screen_frame.w
             swipe_coro(dx, input_timestamp, callback_timestamp)
 
@@ -853,6 +935,24 @@ end
 
 ---start monitoring for window events
 function Events.start()
+    if diagnostics_trace_file then diagnostics_trace_file:close() end
+    diagnostics_trace_file = nil
+    if Events.PaperWM.diagnostics_trace then
+        diagnostics_trace_file = io.open(diagnostics_trace_path, "w")
+        if diagnostics_trace_file then
+            diagnostics_trace_file:setvbuf("line")
+            diagnostics_trace_file:write("PaperWM diagnostics\n")
+            local animation_ok, animation_reason =
+                Events.PaperWM.windows.nativeAnimationStatus()
+            local interactive_ok, interactive_reason =
+                Events.PaperWM.windows.nativeInteractiveStatus()
+            traceDiagnostic(Events.PaperWM,
+                "startup animation_native=%s animation_reason=%s interactive_native=%s interactive_reason=%s",
+                tostring(animation_ok), tostring(animation_reason),
+                tostring(interactive_ok), tostring(interactive_reason))
+        end
+    end
+
     if Events.PaperWM.swipe_debug_trace then
         local file = io.open(swipe_trace_path, "w")
         if file then
@@ -919,6 +1019,10 @@ function Events.stop()
         timer:stop()
         pending_layout_timers[space] = nil
     end
+    for id, timer in pairs(pending_window_timers) do
+        timer:stop()
+        pending_window_timers[id] = nil
+    end
     for space, timer in pairs(pending_swipe_settles) do
         timer:stop()
         pending_swipe_settles[space] = nil
@@ -928,6 +1032,11 @@ function Events.stop()
 
     -- stop listening for touchpad swipes
     Events.Swipe:stop()
+
+    if diagnostics_trace_file then
+        diagnostics_trace_file:close()
+        diagnostics_trace_file = nil
+    end
 
     if Events.mouse_swipe_timer then
         if Events.mouse_swipe_poll then Events.mouse_swipe_poll(true) end

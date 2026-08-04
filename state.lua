@@ -13,7 +13,6 @@ State.is_floating = {} -- dictionary of boolean with window id for keys
 State.x_positions = {} -- dictionary of horizontal positions with [space][id] for keys
 
 State.prev_focused_window = nil ---@type Window|nil
-State.pending_window = nil ---@type Window|nil
 
 ---pretty print the current state
 function State.dump()
@@ -55,14 +54,6 @@ function State.dump()
             State.prev_focused_window:id()))
     else
         table.insert(output, "\nprev_focused_window: nil")
-    end
-
-    if State.pending_window then
-        table.insert(output, string.format("pending_window: %s (%d)",
-            State.pending_window:title(),
-            State.pending_window:id()))
-    else
-        table.insert(output, "pending_window: nil")
     end
 
     table.insert(output, "---------------------")

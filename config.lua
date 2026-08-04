@@ -62,8 +62,13 @@ Config.window_gap = 8 ---@type number|{ top: number, bottom: number, left: numbe
 Config.window_ratios = { 0.23607, 0.38195, 0.61804 } ---@type number[]
 
 ---window animation backend: "accessibility" or experimental "native"
----the native backend automatically falls back when its SkyLight helper is unavailable
+---the native backend prefers direct SkyLight, then an installed Dock payload,
+---and falls back to Accessibility when neither native route can write
 Config.animation_backend = "native" ---@type "accessibility"|"native"
+
+---legacy native and Accessibility position-animation timer frequency;
+---Dock-backed animations use the display's refresh cadence instead
+Config.animation_fps = 120 ---@type number
 
 ---CSS-style cubic Bezier timing curve: { x1, y1, x2, y2 }
 ---x values must be between 0 and 1; y values may extend beyond that range
@@ -81,6 +86,9 @@ Config.swipe_fingers = 0 ---@type number
 
 ---increase this number to make windows move futher when swiping
 Config.swipe_gain = 1 ---@type number
+
+---normalized touch travel before locking a trackpad swipe to an axis
+Config.swipe_direction_threshold = 0.01 ---@type number
 
 ---accept horizontal RawXY from a passively observed Logitech gesture button
 Config.mouse_swipe = false ---@type boolean
@@ -123,6 +131,9 @@ Config.swipe_inertia_max_velocity = 6000 ---@type number
 
 ---write detailed gesture timing to /tmp/paperwm_swipe_trace.log
 Config.swipe_debug_trace = false ---@type boolean
+
+---write compact animation and gesture summaries to /tmp/paperwm_diagnostics.log
+Config.diagnostics_trace = true ---@type boolean
 
 ---center mouse cursor on screen after switching spaces
 Config.center_mouse = true ---@type boolean

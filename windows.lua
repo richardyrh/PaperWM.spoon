@@ -23,11 +23,20 @@ local move_generations = {}
 local focus_guard_target = nil
 local focus_guard_timer = nil
 local focus_guard_generation = 0
-local animation_interval <const> = 1 / 60
+local default_animation_fps <const> = 120
 local watcher_restart_padding <const> = 0.02
 local default_animation_curve <const> = { 0.2, 0.0, 0.0, 1.0 }
 local cached_curve = {}
 local cached_curve_coefficients = nil
+
+local function animationInterval()
+    local fps = tonumber(Windows.PaperWM and Windows.PaperWM.animation_fps) or
+        default_animation_fps
+    if fps ~= fps or math.abs(fps) == math.huge or fps < 1 then
+        fps = default_animation_fps
+    end
+    return 1 / fps
+end
 
 local function curveControlPoints()
     local curve = Windows.PaperWM and Windows.PaperWM.animation_curve or
@@ -199,13 +208,13 @@ local function animatePosition(window, start_frame, end_frame, watcher, generati
     }
 
     if not position_animation_timer then
-        position_animation_timer = Timer.new(animation_interval, animatePositions)
+        position_animation_timer = Timer.new(animationInterval(), animatePositions)
         position_animation_timer:start()
     end
 end
 
--- Optional native helper. It applies private SkyLight presentation transforms,
--- commits positions with CGSMoveWindow, and performs AppKit haptic feedback.
+-- Optional native helper. It prefers direct SkyLight writes, can route rejected
+-- writes through the injected Dock payload, and performs AppKit haptic feedback.
 -- Accessibility remains only for permanent size changes and failure fallback.
 local native_helper = nil
 local native_helper_checked = false
@@ -213,15 +222,108 @@ local native_helper_error = nil
 local native_transform = nil
 local native_transform_checked = false
 local native_transform_error = nil
+local native_move_error = nil
+local native_backend_selection = nil
 local native_haptic = nil
 local native_haptic_checked = false
 local native_haptic_error = nil
 local native_animations = {}
 local native_animation_timer = nil
+local native_animation_batch_timer = nil
+local native_animation_completion_timer = nil
+local native_animation_uses_payload = false
+local scheduleNativeAnimationTransaction
+local scheduleNativeAnimationCompletion
+local animateNativeFrames
 local interactive_moves = nil
+local interactive_move_order = nil
+local interactive_move_direct = false
+local interactive_move_display_link = false
 local quarantined_windows = {}
 local interactive_profile = nil
 local last_interactive_profile = nil
+local native_animation_profile = nil
+local last_native_animation_profile = nil
+local pending_keyboard_navigation = nil
+
+local function resetNativeBackendSelection()
+    native_backend_selection = {
+        checked = false,
+        transform = false,
+        move = false,
+        interactive = false,
+        reason = "native write capability has not been probed",
+    }
+end
+resetNativeBackendSelection()
+
+local function traceNativeAnimation(format, ...)
+    local events = Windows.PaperWM and Windows.PaperWM.events
+    if events and events.trace then events.trace(format, ...) end
+end
+
+local function beginNativeAnimationProfile()
+    if native_animation_profile then return native_animation_profile end
+    native_animation_profile = {
+        started_at = Timer.absoluteTime(),
+        backend = "setAtomic",
+        window_ids = {},
+        frames = 0,
+        transactions = 0,
+        total_skylight_ms = 0,
+        max_skylight_ms = 0,
+        total_commit_ms = 0,
+        ax_position_calls = 0,
+        ax_resize_calls = 0,
+    }
+    if pending_keyboard_navigation and
+        pending_keyboard_navigation.focus_event_at then
+        native_animation_profile.keyboard = pending_keyboard_navigation
+        pending_keyboard_navigation = nil
+    end
+    return native_animation_profile
+end
+
+local function finishNativeAnimationProfile(status)
+    local profile = native_animation_profile
+    if not profile then return end
+
+    local window_count = 0
+    for _ in pairs(profile.window_ids) do window_count = window_count + 1 end
+    profile.window_count = window_count
+    profile.status = status
+    profile.total_ms = (Timer.absoluteTime() - profile.started_at) / 1000000
+    local native_call_count = profile.frames > 0 and profile.frames or
+        profile.transactions
+    profile.average_skylight_ms = native_call_count > 0 and
+        (profile.total_skylight_ms / native_call_count) or 0
+    local keyboard = profile.keyboard
+    profile.keyboard_target = keyboard and keyboard.target or nil
+    profile.request_to_animation_ms = keyboard and
+        ((profile.started_at - keyboard.requested_at) / 1000000) or 0
+    profile.request_to_focus_event_ms = keyboard and keyboard.focus_event_at and
+        ((keyboard.focus_event_at - keyboard.requested_at) / 1000000) or 0
+    profile.focus_call_ms = keyboard and keyboard.focus_call_ms or 0
+    profile.layout_ms = keyboard and keyboard.layout_complete_at and
+        ((keyboard.layout_complete_at - keyboard.focus_event_at) / 1000000) or 0
+    profile.keyboard = nil
+    profile.window_ids = nil
+    last_native_animation_profile = profile
+    native_animation_profile = nil
+
+    traceNativeAnimation(
+        "animation backend=%s status=%s target=%s windows=%d frames=%d transactions=%d request_to_event_ms=%.3f request_to_animation_ms=%.3f focus_call_ms=%.3f layout_ms=%.3f total_ms=%.3f first_frame_ms=%.3f skylight_avg_ms=%.3f skylight_max_ms=%.3f commit_ms=%.3f ax_position_calls=%d ax_resize_calls=%d transform_error=%s error=%s",
+        tostring(profile.backend), tostring(profile.status),
+        tostring(profile.keyboard_target),
+        profile.window_count, profile.frames, profile.transactions,
+        profile.request_to_focus_event_ms, profile.request_to_animation_ms,
+        profile.focus_call_ms, profile.layout_ms, profile.total_ms,
+        profile.first_frame_ms or 0,
+        profile.average_skylight_ms, profile.max_skylight_ms,
+        profile.total_commit_ms, profile.ax_position_calls,
+        profile.ax_resize_calls, tostring(profile.transform_error),
+        tostring(profile.error))
+end
 
 local function loadNativeHelper()
     if native_helper_checked then return native_helper end
@@ -301,11 +403,177 @@ local function nativeCall(method, ...)
     local called, result, reason = pcall(transform[method], ...)
     if not called then return false, result end
     if not result then return false, reason end
+    if method == "set" or method == "setAtomic" or method == "setSingular" then
+        native_transform_error = nil
+    end
     return true, result
 end
 
+local function nativeHelperCall(method, ...)
+    local helper = loadNativeHelper()
+    if not helper then return false, native_helper_error end
+    if type(helper[method]) ~= "function" then
+        return false, string.format("native helper has no %s operation", method)
+    end
+
+    local called, result, reason = pcall(helper[method], ...)
+    if not called then return false, result end
+    if not result then return false, reason end
+    if method == "move" then native_move_error = nil end
+    return true, result
+end
+
+local function nativeCapabilityIDs(preferred)
+    local ids, seen = {}, {}
+    for _, id in ipairs(preferred or {}) do
+        if id and not seen[id] then
+            table.insert(ids, id)
+            seen[id] = true
+        end
+    end
+    local remaining = {}
+    local state = Windows.PaperWM and Windows.PaperWM.state
+    for id in pairs((state and state.index_table) or {}) do
+        if not seen[id] then table.insert(remaining, id) end
+    end
+    table.sort(remaining)
+    for _, id in ipairs(remaining) do table.insert(ids, id) end
+    return ids
+end
+
+local function selectNativeBackends(preferred)
+    local selection = native_backend_selection
+    if selection.checked then return selection end
+    if not Windows.PaperWM or Windows.PaperWM.animation_backend ~= "native" then
+        selection.reason = "native animation backend is not configured"
+        return selection
+    end
+
+    local helper = loadNativeHelper()
+    if not helper then
+        selection.checked = true
+        selection.reason = native_helper_error
+        return selection
+    end
+
+    -- Old helpers do not have the write probe. Preserve their original
+    -- behavior so a source update does not disable a known-working macOS 26
+    -- helper before it is rebuilt.
+    if type(helper.backendProbe) ~= "function" then
+        selection.checked = true
+        selection.legacy = true
+        selection.transform = loadNativeTransform() ~= nil
+        selection.move = type(helper.bounds) == "function" and
+            type(helper.move) == "function"
+        selection.interactive = false
+        selection.reason = "legacy helper; using symbol-based selection"
+        return selection
+    end
+
+    local called, result = pcall(helper.backendProbe,
+        nativeCapabilityIDs(preferred))
+    if not called or type(result) ~= "table" then
+        selection.checked = true
+        selection.reason = called and "native capability probe returned no result" or
+            tostring(result)
+        native_transform_error = selection.reason
+        native_move_error = selection.reason
+        return selection
+    end
+    if not result.checked then
+        selection.reason = result.reason or
+            "no foreign managed window is available to probe"
+        return selection
+    end
+
+    selection.checked = true
+    selection.window_id = result.window_id
+    selection.owner_connection = result.owner_connection
+    selection.main_connection = result.main_connection
+    selection.transform = result.transform == true
+    selection.move = result.move == true
+    selection.animation = result.animation == true
+    selection.interactive = result.interactive == true
+    selection.transform_mode = result.transform_mode
+    selection.transform_backend = result.transform_backend
+    selection.move_backend = result.move_backend
+    selection.dock_capabilities = result.dock_capabilities
+    selection.dock_error = result.dock_error
+    selection.transform_error = result.transform_error
+    selection.move_error = result.move_error
+    selection.reason = nil
+
+    if selection.transform then
+        native_transform_error = nil
+        loadNativeTransform()
+    else
+        native_transform_error = string.format(
+            "native transform unavailable for foreign window %d (error %s)",
+            result.window_id, tostring(result.transform_error))
+    end
+    if selection.move then
+        native_move_error = nil
+    else
+        native_move_error = string.format(
+            "native position write unavailable for foreign window %d (error %s)",
+            result.window_id, tostring(result.move_error))
+    end
+
+    traceNativeAnimation(
+        "backend selected transform=%s transform_backend=%s transform_mode=%s move=%s move_backend=%s display_link_animation=%s display_link_interactive=%s window=%s owner=%s main=%s transform_error=%s move_error=%s dock_error=%s",
+        tostring(selection.transform), tostring(selection.transform_backend),
+        tostring(selection.transform_mode), tostring(selection.move),
+        tostring(selection.move_backend), tostring(selection.animation),
+        tostring(selection.interactive),
+        tostring(selection.window_id), tostring(selection.owner_connection),
+        tostring(selection.main_connection), tostring(selection.transform_error),
+        tostring(selection.move_error), tostring(selection.dock_error))
+    return selection
+end
+
+local function nativeSet(transforms)
+    local helper = loadNativeHelper()
+    local selection = selectNativeBackends()
+    if selection.transform_mode == "singular" and helper and
+        type(helper.setSingular) == "function" then
+        return nativeHelperCall("setSingular", transforms)
+    end
+    return nativeCall("set", transforms)
+end
+
+local function nativeSetAtomic(transforms)
+    local helper = loadNativeHelper()
+    local selection = selectNativeBackends()
+    if selection.transform_mode == "singular" and helper and
+        type(helper.setSingular) == "function" then
+        return nativeHelperCall("setSingular", transforms)
+    end
+    return nativeCall("setAtomic", transforms)
+end
+
+local function nativeAnimate(animations)
+    return nativeHelperCall("animate", animations)
+end
+
+local function nativeDisplayLinkEnabled()
+    local selection = selectNativeBackends()
+    local helper = loadNativeHelper()
+    return selection.transform_backend == "dock" and
+        selection.animation == true and helper ~= nil and
+        type(helper.animate) == "function"
+end
+
+local function nativeInteractiveDisplayLinkEnabled()
+    local selection = selectNativeBackends()
+    local helper = loadNativeHelper()
+    return selection.interactive == true and helper ~= nil and
+        type(helper.interactiveBegin) == "function" and
+        type(helper.interactiveUpdate) == "function" and
+        type(helper.interactiveEnd) == "function"
+end
+
 local function nativeBounds(id)
-    local ok, bounds = nativeCall("bounds", { id })
+    local ok, bounds = nativeHelperCall("bounds", { id })
     if not ok or not bounds or not bounds[1] then return nil, bounds end
     local frame = bounds[1]
     return hs.geometry.rect(frame.x, frame.y, frame.w, frame.h)
@@ -315,7 +583,7 @@ local function nativeBoundsBatch(items)
     local ids = {}
     for _, item in ipairs(items) do table.insert(ids, item.window:id()) end
 
-    local ok, bounds = nativeCall("bounds", ids)
+    local ok, bounds = nativeHelperCall("bounds", ids)
     if not ok then return {}, bounds end
 
     local frames = {}
@@ -327,6 +595,11 @@ end
 
 local function sizesMatch(a, b)
     return a and math.abs(a.w - b.w) <= 1 and math.abs(a.h - b.h) <= 1
+end
+
+local function framesMatch(a, b)
+    return a and sizesMatch(a, b) and
+        math.abs(a.x - b.x) <= 1 and math.abs(a.y - b.y) <= 1
 end
 
 local function targetTransform(record, real_frame)
@@ -359,11 +632,18 @@ local function commitNativePositions(records)
         })
     end
 
+    local identities = identityTransforms(records)
+    local helper = loadNativeHelper()
+    if helper and type(helper.commit) == "function" then
+        local committed = nativeHelperCall("commit", moves, identities)
+        if committed then return true, nil end
+    end
+
     local updates_disabled = nativeCall("beginUpdates")
     local moved, move_error = nativeCall("move", moves)
     local reset_ok, reset_error = false, nil
     if moved then
-        reset_ok, reset_error = nativeCall("set", identityTransforms(records))
+        reset_ok, reset_error = nativeSet(identities)
     end
     if updates_disabled then nativeCall("endUpdates") end
 
@@ -376,15 +656,19 @@ local function settleNativeRecord(record, real_frame)
 
     -- Keep AX as a bounded fallback when WindowServer rejects the permanent
     -- move. Intermediate animation frames never use this path.
+    if native_animation_profile then
+        native_animation_profile.ax_position_calls =
+            native_animation_profile.ax_position_calls + 1
+    end
     local positioned, position_result = pcall(
         record.window.setTopLeft, record.window,
         record.end_frame.x, record.end_frame.y)
     positioned = positioned and position_result ~= false
-    local reset_ok, reset_error = nativeCall("set", identityTransforms({ record }))
+    local reset_ok, reset_error = nativeSet(identityTransforms({ record }))
     if positioned and reset_ok then return true end
 
     if not positioned and real_frame and real_frame.w > 0 and real_frame.h > 0 then
-        nativeCall("set", { targetTransform(record, real_frame) })
+        nativeSet({ targetTransform(record, real_frame) })
     end
     return false, commit_error or
         (not positioned and position_result) or reset_error
@@ -392,7 +676,7 @@ end
 
 local function abandonNativeRecord(record, reason)
     quarantined_windows[record.id] = nil
-    nativeCall("set", identityTransforms({ record }))
+    nativeSet(identityTransforms({ record }))
     restartWatcherAfter(watcher_restart_padding, record.id,
         record.watcher, record.generation)
     if Windows.PaperWM then
@@ -407,7 +691,7 @@ local function commitNativeRecord(record)
     if not real_frame then
         record.missing_count = (record.missing_count or 0) + 1
         if record.missing_count >= 3 then
-            nativeCall("set", identityTransforms({ record }))
+            nativeSet(identityTransforms({ record }))
             quarantined_windows[record.id] = nil
             return true
         end
@@ -420,10 +704,14 @@ local function commitNativeRecord(record)
         return false
     end
 
-    nativeCall("set", { targetTransform(record, real_frame) })
+    nativeSet({ targetTransform(record, real_frame) })
     if not sizesMatch(real_frame, record.end_frame) then
         -- This is deliberately the only AX operation in the native commit path.
         -- hs.window.timeout bounds how long an unresponsive app can hold us here.
+        if native_animation_profile then
+            native_animation_profile.ax_resize_calls =
+                native_animation_profile.ax_resize_calls + 1
+        end
         local resized, resize_error = pcall(record.window.setSize, record.window,
             record.end_frame.w, record.end_frame.h)
         local resized_frame = nativeBounds(record.id)
@@ -445,16 +733,42 @@ end
 
 local function commitNativeAnimations(records, set_real_positions)
     if #records == 0 then return end
+    local commit_started = Timer.absoluteTime()
 
     for _, animation in ipairs(records) do
         native_animations[animation.id] = nil
-        if set_real_positions then
+        if animation.direct then
+            local target = set_real_positions and animation.end_frame or
+                animation.real_frame
+            local moved, move_error = nativeHelperCall("move", { {
+                id = animation.id,
+                x = target.x,
+                y = target.y,
+            } })
+            if not moved then
+                if native_animation_profile then
+                    native_animation_profile.ax_position_calls =
+                        native_animation_profile.ax_position_calls + 1
+                end
+                local positioned, result = pcall(
+                    animation.window.setTopLeft, animation.window,
+                    target.x, target.y)
+                positioned = positioned and result ~= false
+                if not positioned and Windows.PaperWM then
+                    Windows.PaperWM.logger.ef(
+                        "could not commit direct native move for window %d: %s",
+                        animation.id, tostring(move_error or result))
+                end
+            end
+            restartWatcherAfter(watcher_restart_padding, animation.id,
+                animation.watcher, animation.generation)
+        elseif set_real_positions then
             if commitNativeRecord(animation) then
                 restartWatcherAfter(watcher_restart_padding, animation.id,
                     animation.watcher, animation.generation)
             end
         else
-            local reset_ok, reset_error = nativeCall("set", identityTransforms({ animation }))
+            local reset_ok, reset_error = nativeSet(identityTransforms({ animation }))
             if not reset_ok and Windows.PaperWM then
                 Windows.PaperWM.logger.ef(
                     "could not reset native transform: %s", reset_error)
@@ -463,27 +777,109 @@ local function commitNativeAnimations(records, set_real_positions)
                 animation.watcher, animation.generation)
         end
     end
+    if native_animation_profile then
+        native_animation_profile.total_commit_ms =
+            native_animation_profile.total_commit_ms +
+            ((Timer.absoluteTime() - commit_started) / 1000000)
+    end
+end
+
+local function finishNativePayloadRecords(records)
+    if #records == 0 then return end
+    local frames = nativeBoundsBatch(records)
+    local fallback = {}
+
+    for _, record in ipairs(records) do
+        if record.payload_auto_commit and
+            framesMatch(frames[record.id], record.end_frame) then
+            native_animations[record.id] = nil
+            quarantined_windows[record.id] = nil
+            restartWatcherAfter(watcher_restart_padding, record.id,
+                record.watcher, record.generation)
+        else
+            table.insert(fallback, record)
+        end
+    end
+    commitNativeAnimations(fallback, true)
 end
 
 
+local function updateNativeAnimationState(animation, now)
+    if animation.pending_transaction then return 0 end
+    local progress = animation.duration > 0 and
+        math.min(1, math.max(0,
+            (now - animation.started_at) / animation.duration)) or 1
+    local eased = easeProgress(progress)
+    animation.x = animation.start_x +
+        ((animation.end_frame.x - animation.start_x) * eased)
+    animation.y = animation.start_y +
+        ((animation.end_frame.y - animation.start_y) * eased)
+    animation.sx = animation.start_sx +
+        ((animation.end_sx - animation.start_sx) * eased)
+    animation.sy = animation.start_sy +
+        ((animation.end_sy - animation.start_sy) * eased)
+    animation.tx = animation.x - (animation.real_frame.x * animation.sx)
+    animation.ty = animation.y - (animation.real_frame.y * animation.sy)
+    return progress
+end
+
+local function updateAllNativeAnimationStates()
+    local now = Timer.secondsSinceEpoch()
+    for _, animation in pairs(native_animations) do
+        updateNativeAnimationState(animation, now)
+    end
+end
+
+local function stopNativeLifecycleTimers()
+    if native_animation_batch_timer then
+        native_animation_batch_timer:stop()
+        native_animation_batch_timer = nil
+    end
+    if native_animation_completion_timer then
+        native_animation_completion_timer:stop()
+        native_animation_completion_timer = nil
+    end
+end
+
+local function cancelNativePayloadAnimation()
+    if not native_animation_uses_payload then return true, nil end
+    local cancelled, reason = nativeAnimate({})
+    native_animation_uses_payload = false
+    return cancelled, reason
+end
+
 local function stopNativeAnimation(id, set_real_position)
     local animation = native_animations[id]
+    if native_animation_uses_payload then
+        updateAllNativeAnimationStates()
+        cancelNativePayloadAnimation()
+        stopNativeLifecycleTimers()
+    end
     if animation then commitNativeAnimations({ animation }, set_real_position) end
 
-    if native_animation_timer and not next(native_animations) then
-        native_animation_timer:stop()
-        native_animation_timer = nil
+    if not next(native_animations) then
+        if native_animation_timer then
+            native_animation_timer:stop()
+            native_animation_timer = nil
+        end
+        stopNativeLifecycleTimers()
+        if animation then finishNativeAnimationProfile("stopped") end
+    elseif nativeDisplayLinkEnabled() then
+        scheduleNativeAnimationTransaction()
     end
 end
 
 local function stopAllNativeAnimations(set_real_positions)
     local animations = {}
     for _, animation in pairs(native_animations) do table.insert(animations, animation) end
+    cancelNativePayloadAnimation()
+    stopNativeLifecycleTimers()
     commitNativeAnimations(animations, set_real_positions)
     if native_animation_timer then
         native_animation_timer:stop()
         native_animation_timer = nil
     end
+    if #animations > 0 then finishNativeAnimationProfile("stopped") end
 end
 
 -- Take ownership of position-only native animations without resetting their
@@ -491,6 +887,12 @@ end
 -- the exact frame currently visible on screen.
 local function adoptNativeAnimationFrames(items)
     if not next(native_animations) then return nil, nil, false end
+
+    if native_animation_uses_payload then
+        updateAllNativeAnimationStates()
+        cancelNativePayloadAnimation()
+        stopNativeLifecycleTimers()
+    end
 
     local frames, real_frames = {}, {}
     local adopted = {}
@@ -500,33 +902,218 @@ local function adoptNativeAnimationFrames(items)
             if math.abs(animation.sx - 1) > 0.001 or
                 math.abs(animation.sy - 1) > 0.001 or
                 not sizesMatch(animation.real_frame, animation.end_frame) then
+                if nativeDisplayLinkEnabled() then
+                    scheduleNativeAnimationTransaction()
+                end
                 return nil, nil, true
             end
 
             frames[animation.id] = hs.geometry.rect(
                 animation.x, animation.y,
                 animation.real_frame.w, animation.real_frame.h)
-            real_frames[animation.id] = hs.geometry.rect(
-                animation.real_frame.x, animation.real_frame.y,
-                animation.real_frame.w, animation.real_frame.h)
+            if animation.direct then
+                real_frames[animation.id] = hs.geometry.rect(
+                    animation.x, animation.y,
+                    animation.real_frame.w, animation.real_frame.h)
+            else
+                real_frames[animation.id] = hs.geometry.rect(
+                    animation.real_frame.x, animation.real_frame.y,
+                    animation.real_frame.w, animation.real_frame.h)
+            end
             table.insert(adopted, animation)
         end
     end
-    if #adopted == 0 then return nil, nil, false end
+    if #adopted == 0 then
+        if nativeDisplayLinkEnabled() then scheduleNativeAnimationTransaction() end
+        return nil, nil, false
+    end
 
     for _, animation in ipairs(adopted) do
         native_animations[animation.id] = nil
     end
-    if not next(native_animations) and native_animation_timer then
-        native_animation_timer:stop()
-        native_animation_timer = nil
+    if not next(native_animations) then
+        if native_animation_timer then
+            native_animation_timer:stop()
+            native_animation_timer = nil
+        end
+        stopNativeLifecycleTimers()
+        finishNativeAnimationProfile("adopted")
+    elseif nativeDisplayLinkEnabled() then
+        scheduleNativeAnimationTransaction()
     end
     return frames, real_frames, false
 end
 
-local function animateNativeFrames()
+local function recordNativeAnimationCall(call_started, backend)
+    if not native_animation_profile then return end
+    local profile = native_animation_profile
+    local skylight_ms = (Timer.absoluteTime() - call_started) / 1000000
+    profile.backend = backend
+    profile.frames = profile.frames + 1
+    profile.total_skylight_ms = profile.total_skylight_ms + skylight_ms
+    profile.max_skylight_ms = math.max(profile.max_skylight_ms, skylight_ms)
+    if not profile.first_frame_ms then
+        profile.first_frame_ms =
+            (call_started - profile.started_at) / 1000000
+    end
+end
+
+local function recordNativeAnimationTransaction(call_started)
+    if not native_animation_profile then return end
+    local profile = native_animation_profile
+    local native_ms = (Timer.absoluteTime() - call_started) / 1000000
+    profile.backend = "dockDisplayLink"
+    profile.transactions = profile.transactions + 1
+    profile.total_skylight_ms = profile.total_skylight_ms + native_ms
+    profile.max_skylight_ms = math.max(profile.max_skylight_ms, native_ms)
+    if not profile.first_frame_ms then
+        -- The first transform is applied by the next display refresh. Record
+        -- submission latency here; exact display cadence is logged by Dock.
+        profile.first_frame_ms =
+            (call_started - profile.started_at) / 1000000
+    end
+end
+
+local function startNativeAnimationTransaction()
+    native_animation_batch_timer = nil
+    if not next(native_animations) then return end
+
+    local abandoned = {}
+    for id, animation in pairs(native_animations) do
+        if move_generations[id] ~= animation.generation or
+            Windows.PaperWM.state.ui_watchers[id] ~= animation.watcher then
+            table.insert(abandoned, animation)
+        end
+    end
+    if #abandoned > 0 then
+        updateAllNativeAnimationStates()
+        cancelNativePayloadAnimation()
+        commitNativeAnimations(abandoned, false)
+    end
+    if not next(native_animations) then
+        finishNativeAnimationProfile("abandoned")
+        return
+    end
+
     local now = Timer.secondsSinceEpoch()
-    local transforms, finished, abandoned = {}, {}, {}
+    local x1, y1, x2, y2 = curveControlPoints()
+    local animations = {}
+    for _, animation in pairs(native_animations) do
+        if animation.pending_transaction then
+            animation.pending_transaction = false
+            animation.started_at = now
+            animation.duration = Window.animationDuration
+        else
+            updateNativeAnimationState(animation, now)
+        end
+        table.insert(animations, {
+            id = animation.id,
+            direct = animation.direct,
+            auto_commit = animation.payload_auto_commit and
+                not animation.direct,
+            start_x = animation.x,
+            start_y = animation.y,
+            end_x = animation.end_frame.x,
+            end_y = animation.end_frame.y,
+            start_sx = animation.sx,
+            start_sy = animation.sy,
+            end_sx = animation.end_sx,
+            end_sy = animation.end_sy,
+            duration = math.max(0.001,
+                (animation.started_at + animation.duration) - now),
+            curve_x1 = x1,
+            curve_y1 = y1,
+            curve_x2 = x2,
+            curve_y2 = y2,
+        })
+    end
+
+    local call_started = Timer.absoluteTime()
+    local started, reason = nativeAnimate(animations)
+    recordNativeAnimationTransaction(call_started)
+    if started then
+        native_animation_uses_payload = true
+        scheduleNativeAnimationCompletion()
+        return
+    end
+
+    native_animation_uses_payload = false
+    native_backend_selection.animation = false
+    if native_animation_profile then
+        native_animation_profile.error = reason
+    end
+    Windows.PaperWM.logger.wf(
+        "Dock display-link animation failed; using legacy native timer: %s",
+        tostring(reason))
+    if not native_animation_timer then
+        native_animation_timer = Timer.new(animationInterval(), animateNativeFrames)
+        native_animation_timer:start()
+    end
+end
+
+scheduleNativeAnimationCompletion = function()
+    if native_animation_completion_timer then
+        native_animation_completion_timer:stop()
+        native_animation_completion_timer = nil
+    end
+    if not next(native_animations) then return end
+
+    local next_completion = math.huge
+    for _, animation in pairs(native_animations) do
+        next_completion = math.min(next_completion,
+            animation.started_at + animation.duration)
+    end
+    local padding = math.max(0.01, animationInterval() * 2)
+    local delay = math.max(0.001,
+        next_completion + padding - Timer.secondsSinceEpoch())
+    native_animation_completion_timer = Timer.doAfter(delay, function()
+        native_animation_completion_timer = nil
+        local now = Timer.secondsSinceEpoch()
+        local finished = {}
+        local active_count = 0
+        for _, animation in pairs(native_animations) do
+            updateNativeAnimationState(animation, now)
+            active_count = active_count + 1
+            if now >= animation.started_at + animation.duration + padding then
+                table.insert(finished, animation)
+            end
+        end
+
+        if #finished == 0 then
+            scheduleNativeAnimationCompletion()
+            return
+        end
+
+        if #finished < active_count then
+            cancelNativePayloadAnimation()
+        else
+            -- The payload has applied each final transform and stopped its
+            -- display link before this padded completion callback runs.
+            native_animation_uses_payload = false
+        end
+        finishNativePayloadRecords(finished)
+
+        if next(native_animations) then
+            scheduleNativeAnimationTransaction()
+        else
+            finishNativeAnimationProfile("complete")
+        end
+    end)
+end
+
+scheduleNativeAnimationTransaction = function()
+    if native_animation_completion_timer then
+        native_animation_completion_timer:stop()
+        native_animation_completion_timer = nil
+    end
+    if native_animation_batch_timer then return end
+    native_animation_batch_timer = Timer.doAfter(0, startNativeAnimationTransaction)
+end
+
+animateNativeFrames = function()
+    local now = Timer.secondsSinceEpoch()
+    local transforms, transform_records, moves = {}, {}, {}
+    local finished, abandoned = {}, {}
 
     for id, animation in pairs(native_animations) do
         if move_generations[id] ~= animation.generation or
@@ -545,27 +1132,106 @@ local function animateNativeFrames()
             -- the independently interpolated x/y path.
             animation.tx = animation.x - (animation.real_frame.x * animation.sx)
             animation.ty = animation.y - (animation.real_frame.y * animation.sy)
-            table.insert(transforms, {
-                id = id,
-                sx = animation.sx,
-                sy = animation.sy,
-                tx = animation.tx,
-                ty = animation.ty,
-            })
+            if animation.direct then
+                table.insert(moves, {
+                    id = id,
+                    x = animation.x,
+                    y = animation.y,
+                })
+            else
+                table.insert(transforms, {
+                    id = id,
+                    base_x = animation.real_frame.x,
+                    base_y = animation.real_frame.y,
+                    sx = animation.sx,
+                    sy = animation.sy,
+                    tx = animation.tx,
+                    ty = animation.ty,
+                })
+                table.insert(transform_records, animation)
+            end
             if progress >= 1 then table.insert(finished, animation) end
         end
     end
 
     if #abandoned > 0 then commitNativeAnimations(abandoned, false) end
 
-    if #transforms > 0 then
-        local transformed, reason = nativeCall("setAtomic", transforms)
-        if not transformed then
-            native_transform_error = reason
+    if #moves > 0 then
+        local call_started = Timer.absoluteTime()
+        local moved, reason = nativeHelperCall("move", moves)
+        recordNativeAnimationCall(call_started, "move")
+        if not moved then
+            native_move_error = reason
+            if native_animation_profile then native_animation_profile.error = reason end
             stopAllNativeAnimations(true)
             Windows.PaperWM.logger.ef(
-                "native animation failed; falling back to Accessibility: %s", reason)
+                "direct native animation failed; falling back to Accessibility: %s",
+                reason)
             return
+        end
+    end
+
+    if #transforms > 0 then
+        local call_started = Timer.absoluteTime()
+        local transformed, reason = nativeSetAtomic(transforms)
+        recordNativeAnimationCall(call_started, "setAtomic")
+        if transformed and native_animation_profile then
+            native_animation_profile.successful_transform_frames =
+                (native_animation_profile.successful_transform_frames or 0) + 1
+        end
+        if not transformed then
+            native_transform_error = reason
+            if native_animation_profile then
+                native_animation_profile.transform_error = reason
+            end
+
+            -- Preserve the transform backend on systems where it works. If it
+            -- is rejected at runtime, position-only animations can continue on
+            -- the same direct CGSMoveWindow path used by trackpad gestures.
+            local fallback_moves = {}
+            local selection = selectNativeBackends()
+            local helper = loadNativeHelper()
+            local can_move_directly = selection.move and
+                native_move_error == nil and helper ~= nil and
+                type(helper.move) == "function"
+            for _, animation in ipairs(transform_records) do
+                can_move_directly = can_move_directly and
+                    sizesMatch(animation.real_frame, animation.end_frame)
+                table.insert(fallback_moves, {
+                    id = animation.id,
+                    x = animation.x,
+                    y = animation.y,
+                })
+            end
+
+            local moved, move_reason = false, nil
+            if can_move_directly then
+                -- Clear presentation state only if an earlier frame succeeded.
+                -- A first-frame rejection did not establish transforms and
+                -- should transfer directly without touching the singular API.
+                if native_animation_profile and
+                    (native_animation_profile.successful_transform_frames or 0) > 0 then
+                    nativeSet(identityTransforms(transform_records))
+                end
+                local move_started = Timer.absoluteTime()
+                moved, move_reason = nativeHelperCall("move", fallback_moves)
+                recordNativeAnimationCall(move_started, "setAtomic->move")
+            end
+            if moved then
+                for _, animation in ipairs(transform_records) do
+                    animation.direct = true
+                end
+            else
+                if move_reason then native_move_error = move_reason end
+                if native_animation_profile then
+                    native_animation_profile.error = move_reason or reason
+                end
+                stopAllNativeAnimations(true)
+                Windows.PaperWM.logger.ef(
+                    "native animation failed; falling back to Accessibility: %s",
+                    move_reason or reason)
+                return
+            end
         end
     end
 
@@ -574,12 +1240,19 @@ local function animateNativeFrames()
     if not next(native_animations) and native_animation_timer then
         native_animation_timer:stop()
         native_animation_timer = nil
+        finishNativeAnimationProfile("complete")
     end
 end
 
-local function animateNativeFrame(window, real_frame, end_frame, watcher, generation)
+local function animateNativeFrame(window, real_frame, end_frame, watcher, generation, direct)
     local id = window:id()
+    local use_display_link = nativeDisplayLinkEnabled()
+    local profile = beginNativeAnimationProfile()
+    profile.window_ids[id] = true
     local previous = native_animations[id]
+    if previous then
+        updateNativeAnimationState(previous, Timer.secondsSinceEpoch())
+    end
     local quarantined = quarantined_windows[id]
     local start_x = previous and previous.x or
         (quarantined and quarantined.end_frame.x or real_frame.x)
@@ -598,6 +1271,8 @@ local function animateNativeFrame(window, real_frame, end_frame, watcher, genera
         end_frame = end_frame,
         watcher = watcher,
         generation = generation,
+        direct = direct == true,
+        payload_auto_commit = direct == true or sizesMatch(real_frame, end_frame),
         start_x = start_x,
         start_y = start_y,
         start_sx = start_sx,
@@ -612,28 +1287,117 @@ local function animateNativeFrame(window, real_frame, end_frame, watcher, genera
         ty = start_y - (real_frame.y * start_sy),
         started_at = Timer.secondsSinceEpoch(),
         duration = Window.animationDuration,
+        pending_transaction = use_display_link,
     }
 
-    if not native_animation_timer then
-        native_animation_timer = Timer.new(animation_interval, animateNativeFrames)
+    if use_display_link then
+        scheduleNativeAnimationTransaction()
+    elseif not native_animation_timer then
+        native_animation_timer = Timer.new(animationInterval(), animateNativeFrames)
         native_animation_timer:start()
     end
 end
 
-local function nativeBackendEnabled()
+local function nativeBackendEnabled(preferred)
+    local selection = selectNativeBackends(preferred)
     return Windows.PaperWM.animation_backend == "native" and
-        native_transform_error == nil and loadNativeTransform() ~= nil
+        selection.transform and
+        loadNativeTransform() ~= nil
+end
+
+local function nativeMoveBackendEnabled(preferred)
+    if Windows.PaperWM.animation_backend ~= "native" then
+        return false
+    end
+    local selection = selectNativeBackends(preferred)
+    if not selection.move then return false end
+    local helper = loadNativeHelper()
+    return helper ~= nil and type(helper.bounds) == "function" and
+        type(helper.move) == "function"
+end
+
+local function nativeBoundsBackendEnabled()
+    if not Windows.PaperWM or Windows.PaperWM.animation_backend ~= "native" then
+        return false
+    end
+    local helper = loadNativeHelper()
+    return helper ~= nil and type(helper.bounds) == "function"
+end
+
+---record delivery of the focus event that starts a keyboard layout transition
+---@param window Window
+function Windows.noteKeyboardFocusEvent(window)
+    local navigation = pending_keyboard_navigation
+    if navigation and navigation.target == window:id() then
+        navigation.focus_event_at = Timer.absoluteTime()
+    end
+end
+
+---record completion of the synchronous layout pass after a keyboard focus event
+---@param window Window
+function Windows.noteKeyboardLayoutComplete(window)
+    local id = window:id()
+    local navigation = native_animation_profile and native_animation_profile.keyboard
+    if not navigation or navigation.target ~= id then
+        navigation = pending_keyboard_navigation
+    end
+    if not navigation or navigation.target ~= id then return end
+
+    navigation.layout_complete_at = Timer.absoluteTime()
+    if not native_animation_profile then
+        pending_keyboard_navigation = nil
+        local backend = next(position_animations) and "accessibility" or "none"
+        traceNativeAnimation(
+            "animation backend=%s status=scheduled target=%d request_to_event_ms=%.3f focus_call_ms=%.3f layout_ms=%.3f native_reason=%s",
+            backend, id,
+            navigation.focus_event_at and
+                ((navigation.focus_event_at - navigation.requested_at) / 1000000) or 0,
+            navigation.focus_call_ms or 0,
+            navigation.focus_event_at and
+                ((navigation.layout_complete_at - navigation.focus_event_at) / 1000000) or 0,
+            tostring(native_transform_error))
+    end
 end
 
 local function finishInteractiveMove(set_real_positions)
     if not interactive_moves then return end
 
     local records = {}
-    for _, record in pairs(interactive_moves) do table.insert(records, record) end
+    for _, id in ipairs(interactive_move_order or {}) do
+        local record = interactive_moves[id]
+        if record then table.insert(records, record) end
+    end
+    if #records == 0 then
+        for _, record in pairs(interactive_moves) do table.insert(records, record) end
+    end
 
     local committed, commit_error = true, nil
     local position_errors = {}
-    if set_real_positions then
+    if interactive_move_display_link then
+        local moves = {}
+        for _, record in ipairs(records) do
+            table.insert(moves, {
+                id = record.id,
+                x = record.end_frame.x,
+                y = record.end_frame.y,
+            })
+        end
+        committed, commit_error = nativeHelperCall("interactiveEnd", moves)
+        if not committed and set_real_positions then
+            committed, commit_error = nativeHelperCall("move", moves)
+        end
+        if not committed and set_real_positions then
+            for _, record in ipairs(records) do
+                local positioned, result = pcall(
+                    record.window.setTopLeft, record.window,
+                    record.end_frame.x, record.end_frame.y)
+                if not positioned or result == false then
+                    position_errors[record.id] = result
+                end
+            end
+            committed = not next(position_errors)
+        end
+    elseif set_real_positions and not interactive_move_direct then
         committed, commit_error = commitNativePositions(records)
         if not committed then
             for _, record in ipairs(records) do
@@ -645,15 +1409,18 @@ local function finishInteractiveMove(set_real_positions)
                 end
             end
             local reset_ok, reset_error =
-                nativeCall("set", identityTransforms(records))
+                nativeSet(identityTransforms(records))
             committed = reset_ok and not next(position_errors)
             commit_error = commit_error or reset_error
         end
-    else
+    elseif not interactive_move_direct then
         committed, commit_error =
-            nativeCall("set", identityTransforms(records))
+            nativeSet(identityTransforms(records))
     end
     interactive_moves = nil
+    interactive_move_order = nil
+    interactive_move_direct = false
+    interactive_move_display_link = false
 
     if set_real_positions and not committed then
         for _, record in ipairs(records) do
@@ -670,7 +1437,8 @@ local function finishInteractiveMove(set_real_positions)
         last_interactive_profile = interactive_profile
         if Windows.PaperWM then
             Windows.PaperWM.logger.df(
-                "interactive latency: setup %.2f ms (%d windows; pre-begin %.2f, native check %.2f, cleanup %.2f, bounds %.2f, fallback AX %.2f), input %.2f ms avg/%.2f max, SkyLight %.2f ms avg/%.2f max",
+                "interactive latency: backend %s, setup %.2f ms (%d windows; pre-begin %.2f, native check %.2f, cleanup %.2f, bounds %.2f, fallback AX %.2f), input %.2f ms avg/%.2f max, native IPC %.2f ms avg/%.2f max",
+                tostring(interactive_profile.backend),
                 interactive_profile.gesture_setup_ms or 0,
                 interactive_profile.window_count or 0,
                 interactive_profile.pre_begin_ms or 0,
@@ -683,6 +1451,17 @@ local function finishInteractiveMove(set_real_positions)
                 interactive_profile.average_skylight_ms,
                 interactive_profile.max_skylight_ms)
         end
+        traceNativeAnimation(
+            "interactive status=complete backend=%s windows=%d samples=%d setup_ms=%.3f input_avg_ms=%.3f input_max_ms=%.3f native_avg_ms=%.3f native_max_ms=%.3f display_link_error=%s",
+            tostring(interactive_profile.backend),
+            interactive_profile.window_count or 0,
+            interactive_profile.samples or 0,
+            interactive_profile.gesture_setup_ms or 0,
+            interactive_profile.average_input_age_ms,
+            interactive_profile.max_input_age_ms,
+            interactive_profile.average_skylight_ms,
+            interactive_profile.max_skylight_ms,
+            tostring(interactive_profile.display_link_error))
     end
     interactive_profile = nil
 
@@ -697,7 +1476,7 @@ end
 local function clearQuarantinedWindows()
     local records = {}
     for _, record in pairs(quarantined_windows) do table.insert(records, record) end
-    if #records > 0 then nativeCall("set", identityTransforms(records)) end
+    if #records > 0 then nativeSet(identityTransforms(records)) end
     for id, record in pairs(quarantined_windows) do
         quarantined_windows[id] = nil
         restartWatcherAfter(watcher_restart_padding, id,
@@ -736,6 +1515,9 @@ Windows.Direction = Direction
 ---@param paperwm PaperWM
 function Windows.init(paperwm)
     Windows.PaperWM = paperwm
+    native_transform_error = nil
+    native_move_error = nil
+    resetNativeBackendSelection()
 end
 
 ---sample the currently configured animation timing curve
@@ -779,8 +1561,9 @@ function Windows.getWindowFrame(window)
     local id = window:id()
     local animation = native_animations[id] or position_animations[id] or
         (interactive_moves and interactive_moves[id]) or quarantined_windows[id]
+    local native_bounds_enabled = nativeBoundsBackendEnabled()
     local frame = animation and animation.end_frame or
-        (nativeBackendEnabled() and nativeBounds(id)) or window:frame()
+        (native_bounds_enabled and nativeBounds(id)) or window:frame()
     return hs.geometry.rect(frame.x, frame.y, frame.w, frame.h)
 end
 
@@ -788,9 +1571,29 @@ end
 ---@return boolean
 ---@return string|nil
 function Windows.nativeAnimationStatus()
-    if native_transform_error then return false, native_transform_error end
-    if loadNativeTransform() then return true, nil end
-    return false, native_transform_error
+    local selection = selectNativeBackends()
+    if selection.transform then return true, nil end
+    return false, native_transform_error or selection.reason
+end
+
+---report whether native direct movement can be used for interactive gestures
+---@return boolean
+---@return string|nil
+function Windows.nativeInteractiveStatus()
+    local selection = selectNativeBackends()
+    if nativeMoveBackendEnabled() then return true, nil end
+    return false, native_move_error or native_helper_error or selection.reason
+end
+
+---report the cached native write-capability decision
+---@return table
+function Windows.nativeBackendStatus()
+    local selection = selectNativeBackends()
+    local status = {}
+    for key, value in pairs(selection) do status[key] = value end
+    status.transform_reason = native_transform_error
+    status.move_reason = native_move_error
+    return status
 end
 
 ---diagnose private transform entry points for managed windows
@@ -880,6 +1683,12 @@ function Windows.interactiveLatencyStatus()
     return last_interactive_profile
 end
 
+---return timing from the most recently completed native layout animation
+---@return table|nil
+function Windows.nativeAnimationLatencyStatus()
+    return last_native_animation_profile
+end
+
 ---begin a compositor-backed interactive position gesture
 ---@param items table[] tables containing a window and optional current frame
 ---@param gesture_started number|nil absolute time before gesture setup began
@@ -890,11 +1699,20 @@ function Windows.beginInteractiveMove(items, gesture_started)
     gesture_started = gesture_started or begin_started
 
     local native_check_started = Timer.absoluteTime()
-    local native_enabled = nativeBackendEnabled()
+    local preferred = {}
+    for _, item in ipairs(items) do table.insert(preferred, item.window:id()) end
+    local native_enabled = nativeMoveBackendEnabled(preferred)
     local native_check_ms = (Timer.absoluteTime() - native_check_started) / 1000000
     if not native_enabled then
+        traceNativeAnimation(
+            "interactive status=unavailable move_error=%s helper_error=%s",
+            tostring(native_move_error), tostring(native_helper_error))
+        local frames = nativeBoundsBackendEnabled() and
+            nativeBoundsBatch(items) or {}
         for _, item in ipairs(items) do
-            if not item.frame then item.frame = item.window:frame() end
+            if not item.frame then
+                item.frame = frames[item.window:id()] or item.window:frame()
+            end
         end
         return false, false
     end
@@ -945,6 +1763,9 @@ function Windows.beginInteractiveMove(items, gesture_started)
     local bounds_ms = (Timer.absoluteTime() - bounds_started) / 1000000
 
     interactive_moves = {}
+    interactive_move_order = {}
+    interactive_move_direct = true
+    interactive_move_display_link = false
     interactive_profile = {
         window_count = #items,
         pre_begin_ms = (begin_started - gesture_started) / 1000000,
@@ -961,6 +1782,7 @@ function Windows.beginInteractiveMove(items, gesture_started)
 
     for _, item in ipairs(items) do
         local id = item.window:id()
+        table.insert(interactive_move_order, id)
         -- Invalidate any delayed watcher restart left by an interrupted
         -- animation; the gesture owner restarts its watchers when it ends.
         move_generations[id] = (move_generations[id] or 0) + 1
@@ -984,12 +1806,34 @@ function Windows.beginInteractiveMove(items, gesture_started)
             end_frame = hs.geometry.rect(frame.x, frame.y, frame.w, frame.h),
         }
     end
+    if nativeInteractiveDisplayLinkEnabled() then
+        local initial_moves = {}
+        for _, id in ipairs(interactive_move_order) do
+            local record = interactive_moves[id]
+            table.insert(initial_moves, {
+                id = id,
+                x = record.end_frame.x,
+                y = record.end_frame.y,
+            })
+        end
+        local started, reason = nativeHelperCall(
+            "interactiveBegin", initial_moves)
+        interactive_move_display_link = started
+        if not started then
+            interactive_profile.display_link_error = reason
+            traceNativeAnimation(
+                "interactive display-link unavailable reason=%s",
+                tostring(reason))
+        end
+    end
+    interactive_profile.backend = interactive_move_display_link and
+        "dockDisplayLink" or "synchronousMove"
     interactive_profile.gesture_setup_ms =
         (Timer.absoluteTime() - gesture_started) / 1000000
     return true, false
 end
 
----apply one batched compositor update during an interactive gesture
+---apply compositor window positions during an interactive gesture
 ---@param items table[] tables containing a window and desired frame
 ---@param input_timestamp number|nil event timestamp in absolute nanoseconds
 ---@return boolean
@@ -999,18 +1843,21 @@ function Windows.updateInteractiveMove(items, input_timestamp)
         return false, "no interactive compositor move is active"
     end
 
-    local transforms = {}
+    local moves = {}
     for _, item in ipairs(items) do
         local record = interactive_moves[item.window:id()]
         if record then
             record.end_frame.x = item.frame.x
             record.end_frame.y = item.frame.y
-            table.insert(transforms, {
+        end
+    end
+    for _, id in ipairs(interactive_move_order or {}) do
+        local record = interactive_moves[id]
+        if record then
+            table.insert(moves, {
                 id = record.id,
-                sx = 1,
-                sy = 1,
-                tx = item.frame.x - record.real_frame.x,
-                ty = item.frame.y - record.real_frame.y,
+                x = record.end_frame.x,
+                y = record.end_frame.y,
             })
         end
     end
@@ -1018,7 +1865,21 @@ function Windows.updateInteractiveMove(items, input_timestamp)
     local call_started = Timer.absoluteTime()
     local input_age_ms = input_timestamp and input_timestamp > 0 and
         math.max(0, (call_started - input_timestamp) / 1000000) or 0
-    local transformed, reason = nativeCall("setAtomic", transforms)
+    local method = interactive_move_display_link and
+        "interactiveUpdate" or "move"
+    local transformed, reason = nativeHelperCall(method, moves)
+    if not transformed and interactive_move_display_link then
+        -- Stop a stale display-link owner before reverting to the legacy
+        -- synchronous route, otherwise its last buffered frame can overwrite
+        -- a later move.
+        nativeHelperCall("interactiveEnd", moves)
+        interactive_move_display_link = false
+        if interactive_profile then
+            interactive_profile.backend = "synchronousMoveFallback"
+            interactive_profile.display_link_error = reason
+        end
+        transformed, reason = nativeHelperCall("move", moves)
+    end
     local skylight_ms = (Timer.absoluteTime() - call_started) / 1000000
     if interactive_profile then
         interactive_profile.samples = interactive_profile.samples + 1
@@ -1033,7 +1894,8 @@ function Windows.updateInteractiveMove(items, input_timestamp)
     end
     if transformed then return true, nil end
 
-    native_transform_error = reason
+    native_move_error = reason
+    traceNativeAnimation("interactive status=failed reason=%s", tostring(reason))
     finishInteractiveMove(true)
     Windows.PaperWM.logger.ef(
         "interactive native move failed; falling back to Accessibility: %s", reason)
@@ -1227,11 +2089,12 @@ function Windows.addWindow(add_window)
     
 
     -- check if window is already in window list
-    if Windows.PaperWM.state.index_table[add_window:id()] then return end
+    local existing_index = Windows.PaperWM.state.index_table[add_window:id()]
+    if existing_index then return existing_index.space end
 
     local space = Spaces.windowSpaces(add_window)[1]
     if not space then
-        Windows.PaperWM.logger.e("add window does not have a space")
+        Windows.PaperWM.logger.df("window %d does not have a Space yet", add_window:id())
         return
     end
     if not Windows.PaperWM.state.window_list[space] then Windows.PaperWM.state.window_list[space] = {} end
@@ -1286,7 +2149,7 @@ function Windows.removeWindow(remove_window, skip_new_window_focus)
     -- get index of window
     local remove_index = Windows.PaperWM.state.index_table[remove_window:id()]
     if not remove_index then
-        Windows.PaperWM.logger.e("remove index not found")
+        Windows.PaperWM.logger.df("ignoring removal of untracked window %d", remove_window:id())
         return
     end
 
@@ -1405,6 +2268,7 @@ end
 ---@param direction Direction use either Direction UP, DOWN, LEFT, or RIGHT
 ---@param focused_index Index index of focused window within the window_list
 function Windows.focusWindow(direction, focused_index)
+    local navigation_started = Timer.absoluteTime()
     if not focused_index then
         -- get current focused window
         local focused_window = focus_guard_target or Window.focusedWindow()
@@ -1459,7 +2323,16 @@ function Windows.focusWindow(direction, focused_index)
     end
 
     -- Keep the destination focused for the complete layout transition.
+    local navigation = {
+        requested_at = navigation_started,
+        target = new_focused_window:id(),
+        space = focused_index.space,
+    }
+    pending_keyboard_navigation = navigation
+    local focus_started = Timer.absoluteTime()
     beginFocusGuard(new_focused_window)
+    navigation.focus_call_ms =
+        (Timer.absoluteTime() - focus_started) / 1000000
 
     return new_focused_window
 end
@@ -2010,12 +2883,20 @@ function Windows.moveWindow(window, frame)
     local generation = (move_generations[id] or 0) + 1
     move_generations[id] = generation
 
-    local current_frame = nativeBackendEnabled() and nativeBounds(id) or window:frame()
+    local preferred = { id }
+    local transform_enabled = nativeBackendEnabled(preferred)
+    local move_enabled = nativeMoveBackendEnabled(preferred)
+    local current_frame = nativeBoundsBackendEnabled() and
+        nativeBounds(id) or window:frame()
     local can_transform = current_frame.w > 0 and current_frame.h > 0
 
-    if can_transform and Window.animationDuration > 0 and nativeBackendEnabled() then
+    if can_transform and Window.animationDuration > 0 and transform_enabled then
         stopPositionAnimation(id)
         animateNativeFrame(window, current_frame, frame, watcher, generation)
+    elseif can_transform and sizesMatch(current_frame, frame) and
+        Window.animationDuration > 0 and move_enabled then
+        stopPositionAnimation(id)
+        animateNativeFrame(window, current_frame, frame, watcher, generation, true)
     elseif current_frame.w == frame.w and current_frame.h == frame.h and
         Window.animationDuration > 0 then
         stopNativeAnimation(id, true)

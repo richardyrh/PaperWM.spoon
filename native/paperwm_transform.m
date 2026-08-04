@@ -7,9 +7,13 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
 #include <lua.h>
 #include <lauxlib.h>
+
+#include "injector/client.h"
 
 typedef int CGSConnectionID;
 typedef int CGSWindowID;
@@ -50,6 +54,19 @@ static CGSReenableUpdateFn reenableUpdate = NULL;
 static CGSMoveWindowFn moveWindow = NULL;
 static const char *loadError = NULL;
 
+typedef enum {
+    NATIVE_ROUTE_UNKNOWN = 0,
+    NATIVE_ROUTE_SKYLIGHT,
+    NATIVE_ROUTE_DOCK,
+    NATIVE_ROUTE_UNAVAILABLE,
+} NativeRoute;
+
+static NativeRoute transformRoute = NATIVE_ROUTE_UNKNOWN;
+static NativeRoute moveRoute = NATIVE_ROUTE_UNKNOWN;
+static bool dockCapabilityChecked = false;
+static uint32_t dockCapabilities = 0;
+static char dockCapabilityError[256] = {0};
+
 #define HIDPP_LONG_REPORT 0x11
 #define HIDPP_SHORT_REPORT 0x10
 #define HIDPP_MAX_DEVICES 8
@@ -74,6 +91,60 @@ static int32_t hidppAccumulatedX = 0;
 static int32_t hidppAccumulatedY = 0;
 
 static int pushCGError(lua_State *L, CGError error);
+static bool transformsEqual(CGAffineTransform a, CGAffineTransform b);
+
+static const char *nativeRouteName(NativeRoute route) {
+    switch (route) {
+    case NATIVE_ROUTE_SKYLIGHT: return "skylight";
+    case NATIVE_ROUTE_DOCK: return "dock";
+    case NATIVE_ROUTE_UNAVAILABLE: return "unavailable";
+    case NATIVE_ROUTE_UNKNOWN: return "unknown";
+    }
+    return "unknown";
+}
+
+static void invalidateDockCapabilities(const char *error) {
+    dockCapabilityChecked = false;
+    dockCapabilities = 0;
+    if (error && *error) {
+        snprintf(dockCapabilityError, sizeof(dockCapabilityError), "%s", error);
+    } else {
+        dockCapabilityError[0] = '\0';
+    }
+}
+
+static bool refreshDockCapabilities(void) {
+    paperwm_injector_response_t response = {0};
+    char error[sizeof(dockCapabilityError)] = {0};
+    bool available = paperwm_injector_handshake(
+        getuid(), &response, error, sizeof(error));
+    dockCapabilityChecked = true;
+    dockCapabilities = available ? response.capabilities : 0;
+    if (available) {
+        dockCapabilityError[0] = '\0';
+    } else {
+        snprintf(dockCapabilityError, sizeof(dockCapabilityError), "%s", error);
+    }
+    return available;
+}
+
+static bool dockHasCapability(uint32_t capability, bool refresh) {
+    if (refresh || !dockCapabilityChecked) refreshDockCapabilities();
+    return (dockCapabilities & capability) == capability;
+}
+
+static int pushNativeRouteError(lua_State *L,
+                                const char *operation,
+                                const char *error) {
+    lua_pushnil(L);
+    lua_pushfstring(L,
+                    "%s backend failed for %s: %s",
+                    nativeRouteName(strcmp(operation, "move") == 0 ?
+                                        moveRoute : transformRoute),
+                    operation,
+                    (error && *error) ? error : "unknown error");
+    return 2;
+}
 
 static void hidppInputReport(void *context,
                              IOReturn result,
@@ -369,36 +440,277 @@ static int windowBounds(lua_State *L) {
     return 1;
 }
 
+static CGError moveOneWindow(CGSConnectionID connection,
+                             CGSWindowID windowID,
+                             CGPoint point,
+                             CGSConnectionID *ownerOut) {
+    CGSConnectionID windowConnection = connection;
+    CGSConnectionID ownerConnection = 0;
+    if (getWindowOwner &&
+        getWindowOwner(connection, windowID, &ownerConnection) ==
+            kCGErrorSuccess && ownerConnection) {
+        windowConnection = ownerConnection;
+    }
+    if (ownerOut) *ownerOut = ownerConnection;
+
+    CGError error = moveWindow(windowConnection, windowID, &point);
+    if (error != kCGErrorSuccess && windowConnection != connection) {
+        error = moveWindow(connection, windowID, &point);
+    }
+    return error;
+}
+
+static paperwm_injector_move_t *readMoveTable(lua_State *L,
+                                              int tableIndex,
+                                              uint32_t *countOut) {
+    tableIndex = lua_absindex(L, tableIndex);
+    lua_Integer luaCount = luaL_len(L, tableIndex);
+    if (luaCount < 0 || (uint64_t)luaCount > UINT32_MAX) {
+        luaL_error(L, "native move batch is too large");
+    }
+    uint32_t count = (uint32_t)luaCount;
+    paperwm_injector_move_t *moves =
+        count > 0 ? calloc(count, sizeof(*moves)) : NULL;
+    if (count > 0 && !moves) {
+        luaL_error(L, "could not allocate native move batch");
+    }
+
+    for (uint32_t index = 0; index < count; ++index) {
+        lua_geti(L, tableIndex, (lua_Integer)index + 1);
+        luaL_checktype(L, -1, LUA_TTABLE);
+
+        lua_getfield(L, -1, "id");
+        moves[index].window_id = (uint32_t)luaL_checkinteger(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, -1, "x");
+        moves[index].x = luaL_checknumber(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, -1, "y");
+        moves[index].y = luaL_checknumber(L, -1);
+        lua_pop(L, 1);
+        lua_pop(L, 1);
+    }
+
+    *countOut = count;
+    return moves;
+}
+
 static int windowMove(lua_State *L) {
     luaL_checktype(L, 1, LUA_TTABLE);
     if (!loadSkyLight()) return luaL_error(L, "%s", loadError);
+
+    uint32_t count = 0;
+    paperwm_injector_move_t *moves = readMoveTable(L, 1, &count);
+    if (count == 0) {
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+
+    char dockError[256] = {0};
+    if (moveRoute == NATIVE_ROUTE_DOCK) {
+        bool moved = paperwm_injector_move(
+            getuid(), moves, count, NULL,
+            dockError, sizeof(dockError));
+        if (moved) {
+            free(moves);
+            lua_pushboolean(L, 1);
+            return 1;
+        }
+        invalidateDockCapabilities(dockError);
+    }
+
+    if (moveRoute == NATIVE_ROUTE_UNAVAILABLE &&
+        dockHasCapability(PAPERWM_INJECTOR_CAP_MOVE, true) &&
+        paperwm_injector_move(getuid(), moves, count, NULL,
+                              dockError, sizeof(dockError))) {
+        moveRoute = NATIVE_ROUTE_DOCK;
+        free(moves);
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+
     if (!moveWindow) {
+        free(moves);
+        moveRoute = NATIVE_ROUTE_UNAVAILABLE;
+        return pushNativeRouteError(
+            L, "move", dockError[0] ? dockError : "CGSMoveWindow is unavailable");
+    }
+
+    CGSConnectionID connection = mainConnectionID();
+    CGError directError = kCGErrorSuccess;
+    CGSConnectionID failedOwner = 0;
+    uint32_t failedWindow = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        CGPoint point = CGPointMake(moves[i].x, moves[i].y);
+        CGSConnectionID ownerConnection = 0;
+        directError = moveOneWindow(
+            connection, moves[i].window_id, point, &ownerConnection);
+        if (directError != kCGErrorSuccess) {
+            failedOwner = ownerConnection;
+            failedWindow = moves[i].window_id;
+            break;
+        }
+    }
+
+    if (directError == kCGErrorSuccess) {
+        moveRoute = NATIVE_ROUTE_SKYLIGHT;
+        free(moves);
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+
+    if (dockHasCapability(PAPERWM_INJECTOR_CAP_MOVE, true) &&
+        paperwm_injector_move(getuid(), moves, count, NULL,
+                              dockError, sizeof(dockError))) {
+        moveRoute = NATIVE_ROUTE_DOCK;
+        free(moves);
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+
+    moveRoute = NATIVE_ROUTE_UNAVAILABLE;
+    free(moves);
+    lua_pushnil(L);
+    if (dockError[0]) {
+        lua_pushfstring(
+            L,
+            "native move unavailable: SkyLight CGError %d for window %d "
+            "(owner %d, main %d); Dock: %s",
+            directError, failedWindow, failedOwner, connection, dockError);
+    } else {
+        lua_pushfstring(
+            L,
+            "native move unavailable: SkyLight CGError %d for window %d "
+            "(owner %d, main %d); Dock payload unavailable",
+            directError, failedWindow, failedOwner, connection);
+    }
+    return 2;
+}
+
+typedef bool (*PaperWMInteractiveRequestFn)(
+    uid_t,
+    const paperwm_injector_move_t *,
+    uint32_t,
+    paperwm_injector_response_t *,
+    char *,
+    size_t);
+
+static int windowInteractiveRequest(lua_State *L,
+                                    PaperWMInteractiveRequestFn request,
+                                    const char *operation,
+                                    bool requireCapability) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    if (requireCapability &&
+        !dockHasCapability(PAPERWM_INJECTOR_CAP_INTERACTIVE, false)) {
         lua_pushnil(L);
-        lua_pushstring(L, "CGSMoveWindow is unavailable");
+        lua_pushstring(L, "Dock display-link interaction is unavailable");
+        return 2;
+    }
+
+    uint32_t count = 0;
+    paperwm_injector_move_t *moves = readMoveTable(L, 1, &count);
+    char error[256] = {0};
+    bool succeeded = request(
+        getuid(), moves, count, NULL, error, sizeof(error));
+    free(moves);
+    if (!succeeded) {
+        invalidateDockCapabilities(error);
+        lua_pushnil(L);
+        lua_pushfstring(L,
+                        "Dock display-link interaction %s failed: %s",
+                        operation,
+                        error);
+        return 2;
+    }
+
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int windowInteractiveBegin(lua_State *L) {
+    return windowInteractiveRequest(
+        L, paperwm_injector_interactive_begin, "begin", true);
+}
+
+static int windowInteractiveUpdate(lua_State *L) {
+    return windowInteractiveRequest(
+        L, paperwm_injector_interactive_update, "update", true);
+}
+
+static int windowInteractiveEnd(lua_State *L) {
+    return windowInteractiveRequest(
+        L, paperwm_injector_interactive_end, "end", false);
+}
+
+static int windowAnimate(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+
+    if (!dockHasCapability(PAPERWM_INJECTOR_CAP_ANIMATE, false)) {
+        lua_pushnil(L);
+        lua_pushstring(L, "Dock display-link animation is unavailable");
         return 2;
     }
 
     lua_Integer count = luaL_len(L, 1);
-    CGSConnectionID connection = mainConnectionID();
-    for (lua_Integer i = 1; i <= count; i++) {
+    paperwm_injector_animation_t *animations =
+        calloc((size_t)count, sizeof(*animations));
+    if (count > 0 && !animations) {
+        return luaL_error(L, "could not allocate native animation batch");
+    }
+
+    for (lua_Integer i = 1; i <= count; ++i) {
+        paperwm_injector_animation_t *animation = &animations[i - 1];
         lua_geti(L, 1, i);
         luaL_checktype(L, -1, LUA_TTABLE);
 
         lua_getfield(L, -1, "id");
-        CGSWindowID windowID = (CGSWindowID)luaL_checkinteger(L, -1);
-        lua_pop(L, 1);
-        lua_getfield(L, -1, "x");
-        CGFloat x = (CGFloat)luaL_checknumber(L, -1);
-        lua_pop(L, 1);
-        lua_getfield(L, -1, "y");
-        CGFloat y = (CGFloat)luaL_checknumber(L, -1);
-        lua_pop(L, 1);
+        animation->window_id = (uint32_t)luaL_checkinteger(L, -1);
         lua_pop(L, 1);
 
-        CGPoint point = CGPointMake(x, y);
-        CGError error = moveWindow(connection, windowID, &point);
-        if (error != kCGErrorSuccess) return pushCGError(L, error);
+        lua_getfield(L, -1, "direct");
+        if (lua_toboolean(L, -1)) {
+            animation->flags |= PAPERWM_INJECTOR_ANIMATION_MOVE;
+        }
+        lua_pop(L, 1);
+
+        lua_getfield(L, -1, "auto_commit");
+        if (lua_toboolean(L, -1)) {
+            animation->flags |= PAPERWM_INJECTOR_ANIMATION_AUTO_COMMIT;
+        }
+        lua_pop(L, 1);
+
+#define READ_ANIMATION_NUMBER(field) \
+        lua_getfield(L, -1, #field); \
+        animation->field = luaL_checknumber(L, -1); \
+        lua_pop(L, 1)
+        READ_ANIMATION_NUMBER(start_x);
+        READ_ANIMATION_NUMBER(start_y);
+        READ_ANIMATION_NUMBER(end_x);
+        READ_ANIMATION_NUMBER(end_y);
+        READ_ANIMATION_NUMBER(start_sx);
+        READ_ANIMATION_NUMBER(start_sy);
+        READ_ANIMATION_NUMBER(end_sx);
+        READ_ANIMATION_NUMBER(end_sy);
+        READ_ANIMATION_NUMBER(duration);
+        READ_ANIMATION_NUMBER(curve_x1);
+        READ_ANIMATION_NUMBER(curve_y1);
+        READ_ANIMATION_NUMBER(curve_x2);
+        READ_ANIMATION_NUMBER(curve_y2);
+#undef READ_ANIMATION_NUMBER
+        lua_pop(L, 1);
     }
+
+    char error[256] = {0};
+    bool started = paperwm_injector_animate(
+        getuid(), animations, (uint32_t)count, NULL, error, sizeof(error));
+    free(animations);
+    if (!started) {
+        invalidateDockCapabilities(error);
+        lua_pushnil(L);
+        lua_pushfstring(L, "Dock display-link animation failed: %s", error);
+        return 2;
+    }
+
     lua_pushboolean(L, 1);
     return 1;
 }
@@ -430,6 +742,11 @@ static void setIntegerField(lua_State *L, const char *field, lua_Integer value) 
 
 static void setBooleanField(lua_State *L, const char *field, bool value) {
     lua_pushboolean(L, value);
+    lua_setfield(L, -2, field);
+}
+
+static void setStringField(lua_State *L, const char *field, const char *value) {
+    lua_pushstring(L, value);
     lua_setfield(L, -2, field);
 }
 
@@ -481,6 +798,159 @@ static CGSWindowID probeWindowID(lua_State *L, lua_Integer index) {
     }
     lua_pop(L, 1);
     return windowID;
+}
+
+// Determine whether this connection can actually write a foreign window.
+// Symbol availability is insufficient on newer WindowServer builds: read-only
+// operations can work while transform and position writes are denied. Reapply
+// the current values so the probe has no visible effect.
+static int backendProbe(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    if (!loadSkyLight()) return luaL_error(L, "%s", loadError);
+
+    transformRoute = NATIVE_ROUTE_UNKNOWN;
+    moveRoute = NATIVE_ROUTE_UNKNOWN;
+
+    CGSConnectionID connection = mainConnectionID();
+    CGSWindowID windowID = 0;
+    CGSConnectionID ownerConnection = 0;
+    CGError ownerError = kCGErrorSuccess;
+    lua_Integer count = luaL_len(L, 1);
+
+    for (lua_Integer i = 1; i <= count; i++) {
+        CGSWindowID candidate = probeWindowID(L, i);
+        CGSConnectionID owner = 0;
+        CGError error = getWindowOwner ?
+            getWindowOwner(connection, candidate, &owner) : kCGErrorFailure;
+        if (error == kCGErrorSuccess && owner && owner != connection) {
+            windowID = candidate;
+            ownerConnection = owner;
+            ownerError = error;
+            break;
+        }
+        ownerError = error;
+    }
+
+    lua_createtable(L, 0, 10);
+    setIntegerField(L, "main_connection", connection);
+    if (!windowID) {
+        setBooleanField(L, "checked", false);
+        setErrorField(L, "owner_lookup_error", ownerError);
+        lua_pushstring(L, "no foreign managed window is available to probe");
+        lua_setfield(L, -2, "reason");
+        return 1;
+    }
+
+    setBooleanField(L, "checked", true);
+    setIntegerField(L, "window_id", windowID);
+    setIntegerField(L, "owner_connection", ownerConnection);
+
+    CGAffineTransform transform = CGAffineTransformIdentity;
+    CGError getTransformError = getWindowTransform ?
+        getWindowTransform(connection, windowID, &transform) : kCGErrorFailure;
+    CGError batchTransformError = getTransformError;
+    if (batchTransformError == kCGErrorSuccess) {
+        batchTransformError = setWindowTransforms ?
+            setWindowTransforms(connection, &windowID, &transform, 1) :
+            kCGErrorFailure;
+    }
+    setErrorField(L, "batch_transform_error", batchTransformError);
+
+    CGError singularTransformError = kCGErrorFailure;
+    const char *transformMode = NULL;
+    if (batchTransformError == kCGErrorSuccess) {
+        transformMode = "batch";
+        singularTransformError = kCGErrorSuccess;
+    } else if (getTransformError == kCGErrorSuccess && setWindowTransform) {
+        CGAffineTransform probe = transform;
+        probe.tx += 0.25;
+        singularTransformError =
+            setWindowTransform(connection, windowID, probe);
+        if (singularTransformError == kCGErrorSuccess) {
+            CGAffineTransform readback = CGAffineTransformIdentity;
+            CGError readbackError =
+                getWindowTransform(connection, windowID, &readback);
+            bool applied = readbackError == kCGErrorSuccess &&
+                transformsEqual(readback, probe);
+
+            // Always restore after a successful setter call, even if readback
+            // did not match the request.
+            CGError restoreError =
+                setWindowTransform(connection, windowID, transform);
+            readback = CGAffineTransformIdentity;
+            CGError restoreReadbackError = restoreError == kCGErrorSuccess ?
+                getWindowTransform(connection, windowID, &readback) :
+                restoreError;
+            bool restored = restoreReadbackError == kCGErrorSuccess &&
+                transformsEqual(readback, transform);
+            singularTransformError = applied && restored ?
+                kCGErrorSuccess : kCGErrorFailure;
+        }
+        if (singularTransformError == kCGErrorSuccess) {
+            transformMode = "singular";
+        }
+    }
+    setErrorField(L, "singular_transform_error", singularTransformError);
+
+    CGRect bounds = CGRectZero;
+    CGError moveError = getWindowBounds ?
+        getWindowBounds(connection, windowID, &bounds) : kCGErrorFailure;
+    CGSConnectionID moveOwner = 0;
+    if (moveError == kCGErrorSuccess) {
+        moveError = moveWindow ?
+            moveOneWindow(connection, windowID, bounds.origin, &moveOwner) :
+            kCGErrorFailure;
+    }
+    if (moveOwner) setIntegerField(L, "move_owner_connection", moveOwner);
+
+    bool directTransform = transformMode != NULL;
+    bool directMove = moveError == kCGErrorSuccess;
+    // The Dock may provide display-linked animation/interaction even when
+    // direct SkyLight writes still work on this OS version.
+    bool dockReady = refreshDockCapabilities();
+
+    if (directTransform) {
+        transformRoute = NATIVE_ROUTE_SKYLIGHT;
+    } else if (dockReady &&
+               (dockCapabilities & PAPERWM_INJECTOR_CAP_TRANSFORM)) {
+        transformRoute = NATIVE_ROUTE_DOCK;
+        transformMode = "dock";
+    } else {
+        transformRoute = NATIVE_ROUTE_UNAVAILABLE;
+    }
+
+    if (directMove) {
+        moveRoute = NATIVE_ROUTE_SKYLIGHT;
+    } else if (dockReady && (dockCapabilities & PAPERWM_INJECTOR_CAP_MOVE)) {
+        moveRoute = NATIVE_ROUTE_DOCK;
+    } else {
+        moveRoute = NATIVE_ROUTE_UNAVAILABLE;
+    }
+
+    bool transformAvailable = transformRoute != NATIVE_ROUTE_UNAVAILABLE;
+    bool moveAvailable = moveRoute != NATIVE_ROUTE_UNAVAILABLE;
+    bool animationAvailable = transformRoute == NATIVE_ROUTE_DOCK &&
+        dockReady && (dockCapabilities & PAPERWM_INJECTOR_CAP_ANIMATE);
+    bool interactiveAvailable = dockReady &&
+        (dockCapabilities & PAPERWM_INJECTOR_CAP_INTERACTIVE);
+    setBooleanField(L, "transform", transformAvailable);
+    setBooleanField(L, "move", moveAvailable);
+    setBooleanField(L, "animation", animationAvailable);
+    setBooleanField(L, "interactive", interactiveAvailable);
+    setErrorField(L, "transform_error", transformAvailable ?
+        kCGErrorSuccess : singularTransformError);
+    setErrorField(L, "move_error", moveAvailable ?
+        kCGErrorSuccess : moveError);
+    setStringField(L, "transform_backend", nativeRouteName(transformRoute));
+    setStringField(L, "move_backend", nativeRouteName(moveRoute));
+    if (transformMode) setStringField(L, "transform_mode", transformMode);
+    if (dockReady) {
+        setIntegerField(L, "dock_capabilities", dockCapabilities);
+    } else if (dockCapabilityError[0]) {
+        lua_pushstring(L, dockCapabilityError);
+        lua_setfield(L, -2, "dock_error");
+    }
+    return 1;
 }
 
 static void probeConnection(lua_State *L,
@@ -687,7 +1157,141 @@ static CGError setSingularTransformsVerified(CGSConnectionID connection,
     return error;
 }
 
-static int transformSetImpl(lua_State *L, bool atomic) {
+static bool sendDockTransforms(const CGSWindowID *windowIDs,
+                               const CGAffineTransform *transforms,
+                               const CGPoint *baseOrigins,
+                               uint32_t count,
+                               char *error,
+                               size_t errorSize) {
+    paperwm_injector_transform_t *items =
+        calloc(count, sizeof(*items));
+    if (!items) {
+        snprintf(error, errorSize, "could not allocate Dock transform batch");
+        return false;
+    }
+
+    CGSConnectionID connection = mainConnectionID();
+    for (uint32_t i = 0; i < count; ++i) {
+        CGPoint base = baseOrigins ? baseOrigins[i] : CGPointMake(NAN, NAN);
+        if (!isfinite(base.x) || !isfinite(base.y)) {
+            CGRect bounds = CGRectZero;
+            CGError boundsError = getWindowBounds(
+                connection, windowIDs[i], &bounds);
+            if (boundsError != kCGErrorSuccess) {
+                snprintf(error,
+                         errorSize,
+                         "could not read bounds for Dock transform window %d: CGError %d",
+                         windowIDs[i],
+                         boundsError);
+                free(items);
+                return false;
+            }
+            base = bounds.origin;
+        }
+        items[i].window_id = (uint32_t)windowIDs[i];
+        items[i].base_x = base.x;
+        items[i].base_y = base.y;
+        items[i].sx = transforms[i].a;
+        items[i].sy = transforms[i].d;
+        items[i].tx = transforms[i].tx;
+        items[i].ty = transforms[i].ty;
+    }
+
+    bool result = paperwm_injector_transform(
+        getuid(), items, count, NULL, error, errorSize);
+    free(items);
+    return result;
+}
+
+static int windowCommit(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    luaL_checktype(L, 2, LUA_TTABLE);
+
+    lua_Integer moveCount = luaL_len(L, 1);
+    lua_Integer transformCount = luaL_len(L, 2);
+    if (moveCount != transformCount) {
+        lua_pushnil(L);
+        lua_pushstring(L, "native commit move/transform counts do not match");
+        return 2;
+    }
+    if (moveCount == 0) {
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+    if (transformRoute != NATIVE_ROUTE_DOCK &&
+        moveRoute != NATIVE_ROUTE_DOCK) {
+        lua_pushnil(L);
+        lua_pushstring(L, "Dock atomic commit is not selected");
+        return 2;
+    }
+    if (!dockHasCapability(PAPERWM_INJECTOR_CAP_COMMIT, false)) {
+        lua_pushnil(L);
+        lua_pushfstring(L,
+                        "Dock payload does not support atomic commit: %s",
+                        dockCapabilityError[0] ? dockCapabilityError :
+                            "capability unavailable");
+        return 2;
+    }
+
+    paperwm_injector_commit_t *commits =
+        calloc((size_t)moveCount, sizeof(*commits));
+    if (!commits) return luaL_error(L, "could not allocate native commit batch");
+
+    for (lua_Integer i = 1; i <= moveCount; ++i) {
+        lua_geti(L, 1, i);
+        luaL_checktype(L, -1, LUA_TTABLE);
+        lua_getfield(L, -1, "id");
+        commits[i - 1].window_id = (uint32_t)luaL_checkinteger(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, -1, "x");
+        commits[i - 1].x = luaL_checknumber(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, -1, "y");
+        commits[i - 1].y = luaL_checknumber(L, -1);
+        lua_pop(L, 1);
+        lua_pop(L, 1);
+
+        lua_geti(L, 2, i);
+        luaL_checktype(L, -1, LUA_TTABLE);
+        lua_getfield(L, -1, "id");
+        uint32_t transformWindow =
+            (uint32_t)luaL_checkinteger(L, -1);
+        lua_pop(L, 1);
+        if (transformWindow != commits[i - 1].window_id) {
+            free(commits);
+            return luaL_error(L, "native commit window order does not match");
+        }
+        lua_getfield(L, -1, "sx");
+        commits[i - 1].sx = luaL_optnumber(L, -1, 1.0);
+        lua_pop(L, 1);
+        lua_getfield(L, -1, "sy");
+        commits[i - 1].sy = luaL_optnumber(L, -1, 1.0);
+        lua_pop(L, 1);
+        lua_getfield(L, -1, "tx");
+        commits[i - 1].tx = luaL_optnumber(L, -1, 0.0);
+        lua_pop(L, 1);
+        lua_getfield(L, -1, "ty");
+        commits[i - 1].ty = luaL_optnumber(L, -1, 0.0);
+        lua_pop(L, 1);
+        lua_pop(L, 1);
+    }
+
+    char error[256] = {0};
+    bool committed = paperwm_injector_commit(
+        getuid(), commits, (uint32_t)moveCount, NULL, error, sizeof(error));
+    free(commits);
+    if (!committed) {
+        invalidateDockCapabilities(error);
+        lua_pushnil(L);
+        lua_pushfstring(L, "Dock atomic commit failed: %s", error);
+        return 2;
+    }
+
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int transformSetImpl(lua_State *L, bool atomic, bool singularOnly) {
     luaL_checktype(L, 1, LUA_TTABLE);
     if (!loadSkyLight()) return luaL_error(L, "%s", loadError);
 
@@ -699,9 +1303,11 @@ static int transformSetImpl(lua_State *L, bool atomic) {
 
     CGSWindowID *windowIDs = calloc((size_t)count, sizeof(*windowIDs));
     CGAffineTransform *transforms = calloc((size_t)count, sizeof(*transforms));
-    if (!windowIDs || !transforms) {
+    CGPoint *baseOrigins = calloc((size_t)count, sizeof(*baseOrigins));
+    if (!windowIDs || !transforms || !baseOrigins) {
         free(windowIDs);
         free(transforms);
+        free(baseOrigins);
         return luaL_error(L, "could not allocate transform batch");
     }
 
@@ -729,37 +1335,102 @@ static int transformSetImpl(lua_State *L, bool atomic) {
         CGFloat ty = (CGFloat)luaL_optnumber(L, -1, 0.0);
         lua_pop(L, 1);
 
+        baseOrigins[i - 1] = CGPointMake(NAN, NAN);
+        lua_getfield(L, -1, "base_x");
+        if (lua_isnumber(L, -1)) {
+            baseOrigins[i - 1].x = (CGFloat)lua_tonumber(L, -1);
+        }
+        lua_pop(L, 1);
+        lua_getfield(L, -1, "base_y");
+        if (lua_isnumber(L, -1)) {
+            baseOrigins[i - 1].y = (CGFloat)lua_tonumber(L, -1);
+        }
+        lua_pop(L, 1);
+
         transforms[i - 1] = CGAffineTransformMake(sx, 0, 0, sy, tx, ty);
         lua_pop(L, 1);
     }
 
+    char dockError[256] = {0};
+    if (transformRoute == NATIVE_ROUTE_DOCK ||
+        transformRoute == NATIVE_ROUTE_UNAVAILABLE) {
+        bool canTryDock = transformRoute == NATIVE_ROUTE_DOCK ||
+            dockHasCapability(PAPERWM_INJECTOR_CAP_TRANSFORM, true);
+        if (canTryDock && sendDockTransforms(
+                windowIDs, transforms, baseOrigins, (uint32_t)count,
+                dockError, sizeof(dockError))) {
+            transformRoute = NATIVE_ROUTE_DOCK;
+            free(windowIDs);
+            free(transforms);
+            free(baseOrigins);
+            lua_pushboolean(L, 1);
+            return 1;
+        }
+        if (canTryDock) invalidateDockCapabilities(dockError);
+    }
+
     CGSConnectionID connection = mainConnectionID();
     CGError error = kCGErrorSuccess;
-    if (atomic) error = disableUpdate(connection);
-    if (error == kCGErrorSuccess) {
-        error = setWindowTransforms(connection, windowIDs, transforms, (int)count);
-        if (error != kCGErrorSuccess && !atomic) {
-            error = setSingularTransformsVerified(
+    if (singularOnly) {
+        error = setSingularTransformsVerified(
+            connection, windowIDs, transforms, (int)count);
+    } else {
+        if (atomic) error = disableUpdate(connection);
+        if (error == kCGErrorSuccess) {
+            error = setWindowTransforms(
                 connection, windowIDs, transforms, (int)count);
+            if (error != kCGErrorSuccess && !atomic) {
+                error = setSingularTransformsVerified(
+                    connection, windowIDs, transforms, (int)count);
+            }
+            if (atomic) {
+                CGError enableError = reenableUpdate(connection);
+                if (error == kCGErrorSuccess) error = enableError;
+            }
         }
-        if (atomic) {
-            CGError enableError = reenableUpdate(connection);
-            if (error == kCGErrorSuccess) error = enableError;
-        }
+    }
+
+    if (error == kCGErrorSuccess) {
+        transformRoute = NATIVE_ROUTE_SKYLIGHT;
+    } else if (dockHasCapability(PAPERWM_INJECTOR_CAP_TRANSFORM, true) &&
+               sendDockTransforms(windowIDs,
+                                  transforms,
+                                  baseOrigins,
+                                  (uint32_t)count,
+                                  dockError,
+                                  sizeof(dockError))) {
+        transformRoute = NATIVE_ROUTE_DOCK;
+        error = kCGErrorSuccess;
+    } else {
+        transformRoute = NATIVE_ROUTE_UNAVAILABLE;
     }
     free(windowIDs);
     free(transforms);
+    free(baseOrigins);
+    if (error != kCGErrorSuccess && dockError[0]) {
+        lua_pushnil(L);
+        lua_pushfstring(L,
+                        "native transform unavailable: SkyLight CGError %d; "
+                        "Dock: %s",
+                        error,
+                        dockError);
+        return 2;
+    }
     return pushCGError(L, error);
 }
 
 static int transformSet(lua_State *L) {
-    return transformSetImpl(L, false);
+    return transformSetImpl(L, false, false);
 }
 
 static int transformSetAtomic(lua_State *L) {
     // Avoid a global WindowServer update lock in the interactive hot path.
     // The implementation still verifies any singular fallback by readback.
-    return transformSetImpl(L, false);
+    return transformSetImpl(L, false, false);
+}
+
+static int transformSetSingular(lua_State *L) {
+    return transformSetImpl(L, false, true);
 }
 
 static int transformBeginUpdates(lua_State *L) {
@@ -800,11 +1471,18 @@ static int hapticPerform(lua_State *L) {
 
 static const luaL_Reg transformFunctions[] = {
     {"available", transformAvailable},
+    {"backendProbe", backendProbe},
     {"probe", transformProbe},
     {"bounds", windowBounds},
     {"move", windowMove},
+    {"animate", windowAnimate},
+    {"interactiveBegin", windowInteractiveBegin},
+    {"interactiveUpdate", windowInteractiveUpdate},
+    {"interactiveEnd", windowInteractiveEnd},
+    {"commit", windowCommit},
     {"set", transformSet},
     {"setAtomic", transformSetAtomic},
+    {"setSingular", transformSetSingular},
     {"beginUpdates", transformBeginUpdates},
     {"endUpdates", transformEndUpdates},
     {"hapticAvailable", hapticAvailable},

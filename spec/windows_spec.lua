@@ -2,6 +2,9 @@
 
 local native_bounds = {}
 local native_transforms = {}
+local native_capabilities = {}
+local backend_probe_calls = 0
+local native_move_calls = 0
 local original_loadlib = package.loadlib
 
 package.preload["windows"] = function()
@@ -63,6 +66,20 @@ package.preload["windows"] = function()
             return function()
                 return {
                     available = function() return true end,
+                    backendProbe = function(ids)
+                        backend_probe_calls = backend_probe_calls + 1
+                        return {
+                            checked = #ids > 0,
+                            transform = native_capabilities.transform,
+                            move = native_capabilities.move,
+                            transform_mode = native_capabilities.transform_mode,
+                            window_id = ids[1],
+                            owner_connection = 2,
+                            main_connection = 1,
+                            transform_error = native_capabilities.transform_error,
+                            move_error = native_capabilities.move_error,
+                        }
+                    end,
                     bounds = function(ids)
                         local frames = {}
                         for _, id in ipairs(ids) do
@@ -74,7 +91,11 @@ package.preload["windows"] = function()
                         native_transforms = transforms
                         return true
                     end,
-                    move = function() return true end,
+                    move = function(moves)
+                        native_move_calls = native_move_calls + 1
+                        native_transforms = moves
+                        return true
+                    end,
                     set = function() return true end,
                     beginUpdates = function() return true end,
                     endUpdates = function() return true end,
@@ -160,11 +181,45 @@ describe("PaperWM.windows", function()
         mock_paperwm.animation_backend = "none"
         native_bounds = {}
         native_transforms = {}
+        native_capabilities = {
+            transform = true,
+            move = true,
+            transform_mode = "batch",
+            transform_error = 0,
+            move_error = 0,
+        }
+        backend_probe_calls = 0
+        native_move_calls = 0
+        hs.spaces.windowSpaces = function(_) return { 1 } end
         Windows.init(mock_paperwm)
         hs.window.focusedWindow = function() return focused_window end
     end)
 
     describe("beginInteractiveMove", function()
+        it("caches denied foreign-window writes and starts on Accessibility", function()
+            local win = mock_window(101, "Foreign")
+            native_bounds[101] = { id = 101, x = 100, y = 0, w = 100, h = 100 }
+            native_capabilities = {
+                transform = false,
+                move = false,
+                transform_error = 1000,
+                move_error = 1000,
+            }
+            mock_paperwm.animation_backend = "native"
+
+            local first = Windows.beginInteractiveMove({ { window = win, x = 100 } })
+            local second = Windows.beginInteractiveMove({ { window = win, x = 100 } })
+            local status = Windows.nativeBackendStatus()
+
+            assert.is_false(first)
+            assert.is_false(second)
+            assert.is_true(status.checked)
+            assert.is_false(status.transform)
+            assert.is_false(status.move)
+            assert.are.equal(1, backend_probe_calls)
+            assert.are.equal(0, native_move_calls)
+        end)
+
         it("preserves virtual positions when resuming retained transforms", function()
             local win1 = mock_window(101, "Visible")
             local win2 = mock_window(102, "Distant")
@@ -192,7 +247,7 @@ describe("PaperWM.windows", function()
             assert.are.equal(1800, resumed[2].x)
 
             assert.is_true(Windows.updateInteractiveMove(resumed))
-            assert.are.equal(900, native_transforms[2].tx)
+            assert.are.equal(1800, native_transforms[2].x)
             Windows.endInteractiveMove()
         end)
     end)
@@ -210,6 +265,24 @@ describe("PaperWM.windows", function()
             assert.are.equal(1, State.index_table[101].col)
             assert.are.equal(1, State.index_table[101].row)
             assert.is_not_nil(State.ui_watchers[101])
+        end)
+
+        it("returns the existing Space for duplicate visibility events", function()
+            local win = mock_window(101, "Test Window")
+            Windows.addWindow(win)
+
+            assert.are.equal(1, Windows.addWindow(win))
+            assert.are.equal(1, #State.window_list[1])
+            assert.are.equal(1, #State.window_list[1][1])
+        end)
+
+        it("leaves a window untracked until it has a Space", function()
+            local win = mock_window(101, "Test Window")
+            hs.spaces.windowSpaces = function(_) return {} end
+
+            assert.is_nil(Windows.addWindow(win))
+            assert.is_nil(State.index_table[101])
+            assert.is_nil(State.ui_watchers[101])
         end)
     end)
 
@@ -237,6 +310,13 @@ describe("PaperWM.windows", function()
             assert.is_nil(State.window_list[space])
             assert.is_nil(State.index_table[101])
             assert.is_nil(State.ui_watchers[101])
+        end)
+
+        it("ignores removal of a window that was never tracked", function()
+            local win = mock_window(101, "Transient Window")
+
+            assert.is_nil(Windows.removeWindow(win, true))
+            assert.is_nil(State.window_list[1])
         end)
     end)
 

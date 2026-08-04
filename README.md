@@ -179,6 +179,22 @@ Build the helper for the installed Hammerspoon:
 make -C ~/.hammerspoon/Spoons/PaperWM.spoon/native
 ```
 
+On macOS versions that reject foreign-window writes from Hammerspoon, the
+optional Dock injector provides the same native interface through Dock's
+WindowServer connection. It requires the same partial SIP configuration as
+yabai's scripting addition. Build and install it as the logged-in user:
+
+```sh
+cd ~/.hammerspoon/Spoons/PaperWM.spoon/native/injector
+make check
+./install.sh
+```
+
+The installer creates a narrowly scoped, digest-pinned sudoers command and a
+per-user LaunchAgent that reinjects after Dock restarts. See
+[`native/injector/README.md`](native/injector/README.md) for the installed
+files, security prerequisites, status command, and uninstall instructions.
+
 ```lua
 PaperWM.animation_backend = "native" -- default for this experimental build
 
@@ -205,8 +221,12 @@ directly. Resizes still require Accessibility; they use `ax_timeout`, and a
 window that does not respond keeps its compositor presentation while PaperWM
 retries with backoff. `hs.window.timeout` is process-wide, so `ax_timeout`
 also bounds other Hammerspoon window Accessibility calls while PaperWM runs.
-If the helper cannot load or SkyLight rejects a transform, PaperWM falls back
-to Accessibility animation.
+The native helper prefers direct SkyLight writes, then the installed Dock
+payload. If neither native route is available, PaperWM falls back to
+Accessibility animation. With the Dock payload, each layout transition is sent
+once and animated inside Dock using `CVDisplayLink`; there is no per-frame Lua
+timer or per-frame Hammerspoon-to-Dock IPC. Direct SkyLight and older payloads
+retain the configurable legacy timer path (`PaperWM.animation_fps = 120`).
 
 Configure the `PaperWM.window_filter` to set which apps and screens are managed.
 For example:
