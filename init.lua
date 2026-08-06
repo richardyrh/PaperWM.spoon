@@ -105,18 +105,25 @@ function PaperWM:start()
     self.state.is_floating = {}
     self.state.x_positions = {}
 
+    -- Fetch the filtered window snapshot before restoring floating state.
+    -- Calling isWindowAllowed() on an inactive Hammerspoon window filter can
+    -- leave temporary app records behind and break the next watcher startup.
+    local all_windows = self.window_filter:getWindows()
+    local allowed_window_ids = {}
+    for _, window in ipairs(all_windows) do
+        local id = window:id()
+        if id then allowed_window_ids[id] = true end
+    end
+
     -- restore saved is_floating state, filtering for valid windows
     local persisted = hs.settings.get(self.state.IsFloatingKey) or {}
     for _, id in ipairs(persisted) do
-        local window = Window.get(id)
-        if window and self.window_filter:isWindowAllowed(window) then
-            self.state.is_floating[id] = true
-        end
+        if allowed_window_ids[id] then self.state.is_floating[id] = true end
     end
     self.windows.persistFloatingList()
 
     -- populate window list, index table, ui_watchers, and set initial layout
-    self.windows.refreshWindows()
+    self.windows.refreshWindows(all_windows)
     -- Do not expose gesture listeners while initial presentation animations
     -- are still in flight; the first swipe would otherwise interrupt their
     -- per-window commit path and inherit inconsistent transform baselines.

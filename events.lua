@@ -306,11 +306,15 @@ function Events.windowEventHandler(window, event, self)
         space = index.space
         tile_immediately = true
     elseif event == "windowVisible" or event == "windowUnfullscreened" then
-        space = self.windows.addWindow(window)
+        local rejection_reason
+        space, rejection_reason = self.windows.addWindow(window)
         if space then
             cancelPendingWindow(window:id())
-        else
+        elseif rejection_reason == "no space" then
             schedulePendingWindow(self, window)
+            return
+        else
+            cancelPendingWindow(window:id())
             return
         end
     elseif event == "windowNotVisible" or event == "windowDestroyed" then

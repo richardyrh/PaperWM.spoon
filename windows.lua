@@ -235,11 +235,13 @@ local native_animation_uses_payload = false
 local scheduleNativeAnimationTransaction
 local scheduleNativeAnimationCompletion
 local animateNativeFrames
+local setWindowSizeImmediately
 local interactive_moves = nil
 local interactive_move_order = nil
 local interactive_move_direct = false
 local interactive_move_display_link = false
 local quarantined_windows = {}
+local quarantine_timer = nil
 local interactive_profile = nil
 local last_interactive_profile = nil
 local native_animation_profile = nil
@@ -674,6 +676,53 @@ local function settleNativeRecord(record, real_frame)
         (not positioned and position_result) or reset_error
 end
 
+local retryQuarantinedWindow
+
+local function ensureQuarantineTimer()
+    if quarantine_timer then return end
+    quarantine_timer = Timer.new(animationInterval(), function()
+        for _, record in pairs(quarantined_windows) do
+            retryQuarantinedWindow(record)
+        end
+        if not next(quarantined_windows) and quarantine_timer then
+            quarantine_timer:stop()
+            quarantine_timer = nil
+        end
+    end)
+    quarantine_timer:start()
+end
+
+local function retainNativeRecord(record, real_frame, reason)
+    local first_defer = quarantined_windows[record.id] ~= record
+    quarantined_windows[record.id] = record
+    record.resize_deferred_at = record.resize_deferred_at or Timer.absoluteTime()
+    if real_frame and real_frame.w > 0 and real_frame.h > 0 then
+        record.real_frame = real_frame
+        if not framesMatch(record.compensated_frame, real_frame) then
+            local transformed, transform_error =
+                nativeSet({ targetTransform(record, real_frame) })
+            if transformed then
+                record.compensated_frame = real_frame
+            else
+                reason = transform_error or reason
+            end
+        end
+    end
+    ensureQuarantineTimer()
+    if first_defer and Windows.PaperWM then
+        Windows.PaperWM.logger.df(
+            "window %d resize pending; retaining compositor presentation: %s",
+            record.id, tostring(reason or "Accessibility size is asynchronous"))
+        traceNativeAnimation(
+            "resize handoff window=%d status=deferred real=%.0fx%.0f target=%.0fx%.0f reason=%s",
+            record.id,
+            real_frame and real_frame.w or 0,
+            real_frame and real_frame.h or 0,
+            record.end_frame.w, record.end_frame.h,
+            tostring(reason or "Accessibility size is asynchronous"))
+    end
+end
+
 local function abandonNativeRecord(record, reason)
     quarantined_windows[record.id] = nil
     nativeSet(identityTransforms({ record }))
@@ -684,51 +733,106 @@ local function abandonNativeRecord(record, reason)
             "window %d native commit abandoned: %s",
             record.id, tostring(reason or "Accessibility size did not converge"))
     end
+    traceNativeAnimation(
+        "resize handoff window=%d status=abandoned attempts=%d reason=%s",
+        record.id, record.resize_attempts or 0,
+        tostring(reason or "Accessibility size did not converge"))
 end
 
 local function commitNativeRecord(record)
     local real_frame, bounds_error = nativeBounds(record.id)
     if not real_frame then
-        record.missing_count = (record.missing_count or 0) + 1
-        if record.missing_count >= 3 then
-            nativeSet(identityTransforms({ record }))
-            quarantined_windows[record.id] = nil
-            return true
+        local now = Timer.secondsSinceEpoch()
+        record.missing_since = record.missing_since or now
+        if now - record.missing_since >= 0.5 then
+            abandonNativeRecord(record, bounds_error)
+        else
+            retainNativeRecord(record, nil, bounds_error)
         end
-        abandonNativeRecord(record, bounds_error)
         return false
     end
-    record.missing_count = 0
+    record.missing_since = nil
     if real_frame.w <= 0 or real_frame.h <= 0 then
-        abandonNativeRecord(record, "WindowServer reported empty bounds")
+        retainNativeRecord(record, nil, "WindowServer reported empty bounds")
         return false
     end
 
-    nativeSet({ targetTransform(record, real_frame) })
-    if not sizesMatch(real_frame, record.end_frame) then
-        -- This is deliberately the only AX operation in the native commit path.
-        -- hs.window.timeout bounds how long an unresponsive app can hold us here.
-        if native_animation_profile then
-            native_animation_profile.ax_resize_calls =
-                native_animation_profile.ax_resize_calls + 1
+    if not framesMatch(record.compensated_frame, real_frame) then
+        local transformed, transform_error =
+            nativeSet({ targetTransform(record, real_frame) })
+        if not transformed then
+            retainNativeRecord(record, real_frame, transform_error)
+            return false
         end
-        local resized, resize_error = pcall(record.window.setSize, record.window,
-            record.end_frame.w, record.end_frame.h)
+        record.compensated_frame = real_frame
+    end
+    if not sizesMatch(real_frame, record.end_frame) then
+        local now = Timer.secondsSinceEpoch()
+        local should_resize = not record.resize_requested or
+            now >= (record.next_resize_retry or 0)
+        local resized, resize_error = true, nil
+        if should_resize then
+            -- Commit the real size after the presentation animation. Use the
+            -- immediate primitive below so Hammerspoon cannot start or snap a
+            -- second cached animation during this handoff.
+            if native_animation_profile then
+                native_animation_profile.ax_resize_calls =
+                    native_animation_profile.ax_resize_calls + 1
+            end
+            resized, resize_error = setWindowSizeImmediately(
+                record.window, record.end_frame.w, record.end_frame.h)
+            record.resize_requested = true
+            record.resize_attempts = (record.resize_attempts or 0) + 1
+            local retry_delay = record.resize_retry_delay or 0.25
+            record.next_resize_retry = now + retry_delay
+            record.resize_retry_delay = math.min(retry_delay * 2, 8)
+        end
+
+        -- AX size writes can return before WindowServer publishes the new
+        -- bounds. Keep the presentation fixed at the target and let the
+        -- quarantine timer observe convergence instead of exposing the real
+        -- window or issuing a second animation.
         local resized_frame = nativeBounds(record.id)
         if resized_frame then real_frame = resized_frame end
         if not resized or not sizesMatch(real_frame, record.end_frame) then
-            abandonNativeRecord(record, resize_error)
+            retainNativeRecord(record, real_frame,
+                resize_error or "Accessibility size update pending")
             return false
         end
     end
 
     local settled, settle_error = settleNativeRecord(record, real_frame)
     if not settled then
-        abandonNativeRecord(record, settle_error)
+        retainNativeRecord(record, real_frame, settle_error)
         return false
     end
+    if record.resize_deferred_at then
+        traceNativeAnimation(
+            "resize handoff window=%d status=settled attempts=%d delay_ms=%.3f",
+            record.id, record.resize_attempts or 0,
+            (Timer.absoluteTime() - record.resize_deferred_at) / 1000000)
+    end
     quarantined_windows[record.id] = nil
+    record.compensated_frame = nil
+    record.resize_requested = nil
+    record.next_resize_retry = nil
+    record.resize_retry_delay = nil
+    record.resize_attempts = nil
+    record.resize_deferred_at = nil
     return true
+end
+
+retryQuarantinedWindow = function(record)
+    if quarantined_windows[record.id] ~= record then return end
+    if move_generations[record.id] ~= record.generation or
+        Windows.PaperWM.state.ui_watchers[record.id] ~= record.watcher then
+        quarantined_windows[record.id] = nil
+        return
+    end
+    if commitNativeRecord(record) then
+        restartWatcherAfter(watcher_restart_padding, record.id,
+            record.watcher, record.generation)
+    end
 end
 
 local function commitNativeAnimations(records, set_real_positions)
@@ -1244,6 +1348,15 @@ animateNativeFrames = function()
     end
 end
 
+setWindowSizeImmediately = function(window, width, height)
+    local setter = window._setSize
+    if type(setter) ~= "function" then setter = window.setSize end
+    if type(setter) ~= "function" then return false, "window has no size setter" end
+
+    local called, result = pcall(setter, window, { w = width, h = height })
+    return called and result ~= false, result
+end
+
 local function animateNativeFrame(window, real_frame, end_frame, watcher, generation, direct)
     local id = window:id()
     local use_display_link = nativeDisplayLinkEnabled()
@@ -1481,6 +1594,10 @@ local function clearQuarantinedWindows()
         quarantined_windows[id] = nil
         restartWatcherAfter(watcher_restart_padding, id,
             record.watcher, record.generation)
+    end
+    if quarantine_timer then
+        quarantine_timer:stop()
+        quarantine_timer = nil
     end
 end
 
@@ -2032,10 +2149,36 @@ function Windows.tileColumn(windows, bounds, h, w, id, h4id)
     return w -- return width of column
 end
 
+---determine whether a window can be resized before admitting it to tiling
+---@param window Window
+---@return boolean
+---@return string|nil
+function Windows.isResizable(window)
+    local AX = hs.axuielement
+    if not AX or type(AX.windowElement) ~= "function" then return true, nil end
+
+    local created, element = pcall(AX.windowElement, window)
+    if not created or not element or
+        type(element.isAttributeSettable) ~= "function" then
+        return true, nil
+    end
+
+    local queried, settable = pcall(
+        element.isAttributeSettable, element, "AXSize")
+    -- Fail open if AX cannot answer. This filter should only exclude a window
+    -- when macOS explicitly says its size is not writable.
+    if queried and settable == false then
+        return false, "AXSize is not settable"
+    end
+    return true, nil
+end
+
 ---get all windows across all spaces and retile them
-function Windows.refreshWindows()
-    -- get all windows across spaces
-    local all_windows = Windows.PaperWM.window_filter:getWindows()
+---@param all_windows Window[]|nil pre-fetched filtered windows
+function Windows.refreshWindows(all_windows)
+    -- get all windows across spaces unless startup already fetched them while
+    -- initializing the window filter
+    all_windows = all_windows or Windows.PaperWM.window_filter:getWindows()
 
     local retile_spaces = {} -- spaces that need to be retiled
     for _, window in ipairs(all_windows) do
@@ -2061,6 +2204,7 @@ end
 ---add a new window to be tracked and automatically tiled
 ---@param add_window Window new window to be added
 ---@return Space|nil space that contains new window
+---@return string|nil rejection_reason
 function Windows.addWindow(add_window)
     -- A window with no tabs will have a tabCount of 0
     -- A new tab for a window will have tabCount equal to the total number of tabs
@@ -2073,30 +2217,29 @@ function Windows.addWindow(add_window)
         -- use tabs that are all contained within one window and tile fine.
         hs.notify.show("PaperWM", "Windows with tabs are not supported!",
             "See https://github.com/mogenson/PaperWM.spoon/issues/39")
-        return
+        return nil, "unsupported native tab"
     end
 
-    -- ignore windows that have a zoom button, but are not maximizable
-    -- if not add_window:isMaximizable() then
-    --     Windows.PaperWM.logger.d("ignoring non-maximizable window")
-    --     return
-    -- end
-    -- local f = add_window:frame()
-    -- if f.w < 300 and f.h < 300 then
-    --     Windows.PaperWM.logger.d("ignoring small window")
-    --     return
-    -- end
-    
-
-    -- check if window is already in window list
+    -- Check if the window is already tracked before repeating capability work.
     local existing_index = Windows.PaperWM.state.index_table[add_window:id()]
     if existing_index then return existing_index.space end
 
+    -- A visible event can precede macOS assigning the window to a Space. Wait
+    -- for the existing retry path before checking its resize capability.
     local space = Spaces.windowSpaces(add_window)[1]
     if not space then
         Windows.PaperWM.logger.df("window %d does not have a Space yet", add_window:id())
-        return
+        return nil, "no space"
     end
+
+    local resizable, resize_reason = Windows.isResizable(add_window)
+    if not resizable then
+        Windows.PaperWM.logger.df(
+            "ignoring window %d because it is not resizable: %s",
+            add_window:id(), tostring(resize_reason))
+        return nil, "not resizable"
+    end
+
     if not Windows.PaperWM.state.window_list[space] then Windows.PaperWM.state.window_list[space] = {} end
 
     -- find where to insert window

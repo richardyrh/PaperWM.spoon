@@ -20,12 +20,25 @@ package.preload["windows"] = function()
                 windowResized = "windowResized",
             },
         },
+        axuielement = {
+            applicationElement = function(_) return {} end,
+            windowElement = function(window) return window._ax_element end,
+        },
         window = {
             animationDuration = 0.0,
             focusedWindow = function() return nil end,
         },
         geometry = {
-            rect = function(x, y, w, h) return { x = x, y = y, w = w, h = h, x2 = x + w, y2 = y + h } end,
+            rect = function(x, y, w, h)
+                if type(x) == "table" then
+                    x, y, w, h = x.x, x.y, x.w, x.h
+                end
+                return {
+                    x = x, y = y, w = w, h = h,
+                    x2 = x + w, y2 = y + h,
+                    center = { x = x + w / 2, y = y + h / 2 },
+                }
+            end,
         },
         fnutils = {
             partial = function(func, ...)
@@ -57,6 +70,10 @@ package.preload["windows"] = function()
         timer = {
             absoluteTime = function() return 0 end,
             secondsSinceEpoch = function() return 0 end,
+            doAfter = function(_, callback)
+                callback()
+                return { stop = function() end }
+            end,
         },
     }
 
@@ -124,12 +141,13 @@ describe("PaperWM.windows", function()
     end
 
     -- Mock Hammerspoon objects and functions
-    local mock_window = function(id, title, frame)
+    local mock_window = function(id, title, frame, options)
+        options = options or {}
         frame = frame or { x = 0, y = 0, w = 100, h = 100 }
         frame.x2 = frame.x + frame.w
         frame.y2 = frame.y + frame.h
         frame.center = { x = frame.x + frame.w / 2, y = frame.y + frame.h / 2 }
-        return {
+        local window = {
             id = function() return id end,
             title = function() return title end,
             frame = function() return frame end,
@@ -143,9 +161,16 @@ describe("PaperWM.windows", function()
                 }
             end,
             focus = function() end,
-            setFrame = function(new_frame) frame = new_frame end,
+            setFrame = function(_, new_frame) frame = new_frame end,
             screen = function() return mock_screen() end,
         }
+        window._ax_element = {
+            isAttributeSettable = function(_, attribute)
+                assert.are.equal("AXSize", attribute)
+                return options.size_settable ~= false
+            end,
+        }
+        return window
     end
 
     local mock_paperwm = {
@@ -191,7 +216,9 @@ describe("PaperWM.windows", function()
         backend_probe_calls = 0
         native_move_calls = 0
         hs.spaces.windowSpaces = function(_) return { 1 } end
+        hs.window.animationDuration = 0
         Windows.init(mock_paperwm)
+        focused_window = nil
         hs.window.focusedWindow = function() return focused_window end
     end)
 
@@ -284,8 +311,30 @@ describe("PaperWM.windows", function()
             assert.is_nil(State.index_table[101])
             assert.is_nil(State.ui_watchers[101])
         end)
-    end)
 
+        it("ignores a window whose size is not settable", function()
+            local win = mock_window(101, "Fixed", nil, {
+                size_settable = false,
+            })
+
+            local space, reason = Windows.addWindow(win)
+
+            assert.is_nil(space)
+            assert.are.equal("not resizable", reason)
+            assert.is_nil(State.index_table[101])
+            assert.is_nil(State.ui_watchers[101])
+        end)
+
+        it("tiles a window whenever its size is settable", function()
+            local win = mock_window(101, "Resizable")
+
+            local space, reason = Windows.addWindow(win)
+
+            assert.are.equal(1, space)
+            assert.is_nil(reason)
+            assert.is_not_nil(State.index_table[101])
+        end)
+    end)
 
     describe("addWindowsInOrder", function()
         it("should add windows from left to right", function()
