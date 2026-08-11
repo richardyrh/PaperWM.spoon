@@ -367,6 +367,22 @@ describe("PaperWM.windows", function()
             assert.is_nil(Windows.removeWindow(win, true))
             assert.is_nil(State.window_list[1])
         end)
+
+        it("clears x_positions when removing a filtered window by index", function()
+            local win1 = mock_window(101, "Window 1", { x = 0, y = 0, w = 100, h = 100 })
+            local win2 = mock_window(102, "Window 2", { x = 200, y = 0, w = 100, h = 100 })
+            Windows.addWindow(win1)
+            Windows.addWindow(win2)
+            State.x_positions[1] = { [101] = 0, [102] = 200 }
+
+            local space = Windows.removeWindowIndex(State.index_table[101], 101)
+
+            assert.are.equal(1, space)
+            assert.is_nil(State.x_positions[1][101])
+            assert.are.equal(200, State.x_positions[1][102])
+            assert.is_nil(State.index_table[101])
+            assert.is_not_nil(State.index_table[102])
+        end)
     end)
 
     describe("swapWindows", function()

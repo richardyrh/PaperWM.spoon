@@ -2347,22 +2347,10 @@ function Windows.removeWindowIndex(remove_index, remove_id)
     Windows.PaperWM.state.ui_watchers[remove_id]:stop()
     Windows.PaperWM.state.ui_watchers[remove_id] = nil
 
-    -- clear window position
-    hs.printf("trying to remove id %d\n", remove_id)
-
-    local xposs = Windows.PaperWM.state.x_positions
-    if xposs[remove_index.space] and xposs[remove_index.space][remove_window] then
-        xposs[remove_index.space][remove_window] = nil
-    else
-        for i, xpos in pairs(xposs) do
-            for w, _ in pairs(xpos) do
-                if w == remove_id then
-                    print("Removed")
-                    xpos[w] = nil
-                end
-            end
-        end
-    end
+    -- clear the virtual position using the same numeric window ID used by
+    -- x_positions and index_table
+    local positions = Windows.PaperWM.state.x_positions[remove_index.space]
+    if positions then positions[remove_id] = nil end
 
     -- update index table
     Windows.PaperWM.state.index_table[remove_id] = nil
