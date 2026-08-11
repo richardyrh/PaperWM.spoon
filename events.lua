@@ -22,6 +22,26 @@ local pending_layout_timers = {}
 local pending_window_timers = {}
 local swipe_active_spaces = {}
 local layout_debounce <const> = 0.015
+local previous_shutdown_callback = nil
+local hidpp_shutdown_callback = nil
+
+local function installHIDPPShutdownCallback()
+    if hidpp_shutdown_callback then return end
+    previous_shutdown_callback = hs.shutdownCallback
+    hidpp_shutdown_callback = function()
+        Events.PaperWM.windows.stopHIDPPGestureMonitor()
+        if previous_shutdown_callback then previous_shutdown_callback() end
+    end
+    hs.shutdownCallback = hidpp_shutdown_callback
+end
+
+local function removeHIDPPShutdownCallback()
+    if hs.shutdownCallback == hidpp_shutdown_callback then
+        hs.shutdownCallback = previous_shutdown_callback
+    end
+    hidpp_shutdown_callback = nil
+    previous_shutdown_callback = nil
+end
 
 local function scheduleTile(self, space)
     if swipe_active_spaces[space] then return end
@@ -993,6 +1013,7 @@ function Events.start()
             tonumber(Events.PaperWM.mouse_swipe_hidpp_feature_index) or 0x09,
             tonumber(Events.PaperWM.mouse_swipe_hidpp_cid) or 0x00c3)
         if started then
+            installHIDPPShutdownCallback()
             Events.mouse_swipe_poll = Events.mouseSwipePoll(Events.PaperWM)
             Events.mouse_swipe_timer = Timer.new(
                 tonumber(Events.PaperWM.mouse_swipe_poll_interval) or (1 / 120),
@@ -1049,6 +1070,7 @@ function Events.stop()
         Events.mouse_swipe_poll = nil
     end
     Events.PaperWM.windows.stopHIDPPGestureMonitor()
+    removeHIDPPShutdownCallback()
 
     -- stop listening for mouse events
     if Events.mouse_watcher then Events.mouse_watcher:stop() end

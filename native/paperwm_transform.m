@@ -267,12 +267,19 @@ static int hidppMonitorStart(lua_State *L) {
     }
 
     @autoreleasepool {
-        NSDictionary *matching = @{
-            @kIOHIDVendorIDKey: @0x046d,
-            @kIOHIDPrimaryUsagePageKey: @0xff00,
-        };
-        IOHIDManagerSetDeviceMatching(
-            hidppManager, (__bridge CFDictionaryRef)matching);
+        NSArray *matching = @[
+            @{
+                @kIOHIDVendorIDKey: @0x046d,
+                @kIOHIDPrimaryUsagePageKey: @0xff00,
+            },
+            @{
+                @kIOHIDVendorIDKey: @0x046d,
+                @kIOHIDPrimaryUsagePageKey: @0x01,
+                @kIOHIDPrimaryUsageKey: @0x02,
+            },
+        ];
+        IOHIDManagerSetDeviceMatchingMultiple(
+            hidppManager, (__bridge CFArrayRef)matching);
     }
     IOHIDManagerRegisterDeviceMatchingCallback(
         hidppManager, hidppDeviceMatched, NULL);

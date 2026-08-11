@@ -102,7 +102,7 @@ Config.mouse_swipe_invert = false ---@type boolean
 ---accumulated RawXY travel before locking the gesture to an axis
 Config.mouse_swipe_direction_threshold = 1 ---@type number
 
----receiver-local HID++ feature index observed for REPROG_CONTROLS_V4
+---device-local HID++ feature index observed for REPROG_CONTROLS_V4
 Config.mouse_swipe_hidpp_feature_index = 0x09 ---@type number
 
 ---HID++ control ID for the MX Master 3 gesture button
