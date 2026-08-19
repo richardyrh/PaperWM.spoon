@@ -451,18 +451,19 @@ static CGError moveOneWindow(CGSConnectionID connection,
                              CGSWindowID windowID,
                              CGPoint point,
                              CGSConnectionID *ownerOut) {
-    CGSConnectionID windowConnection = connection;
     CGSConnectionID ownerConnection = 0;
     if (getWindowOwner &&
         getWindowOwner(connection, windowID, &ownerConnection) ==
-            kCGErrorSuccess && ownerConnection) {
-        windowConnection = ownerConnection;
+            kCGErrorSuccess && ownerConnection == connection) {
+        ownerConnection = 0;
     }
     if (ownerOut) *ownerOut = ownerConnection;
 
-    CGError error = moveWindow(windowConnection, windowID, &point);
-    if (error != kCGErrorSuccess && windowConnection != connection) {
-        error = moveWindow(connection, windowID, &point);
+    // The main SkyLight connection is the verified foreign-window path.
+    // Owner connections can return success without changing the window.
+    CGError error = moveWindow(connection, windowID, &point);
+    if (error != kCGErrorSuccess && ownerConnection) {
+        error = moveWindow(ownerConnection, windowID, &point);
     }
     return error;
 }
@@ -903,12 +904,36 @@ static int backendProbe(lua_State *L) {
     CGError moveError = getWindowBounds ?
         getWindowBounds(connection, windowID, &bounds) : kCGErrorFailure;
     CGSConnectionID moveOwner = 0;
+    bool moveApplied = false;
+    bool moveRestored = false;
     if (moveError == kCGErrorSuccess) {
+        CGPoint probePoint = CGPointMake(bounds.origin.x + 1, bounds.origin.y);
         moveError = moveWindow ?
-            moveOneWindow(connection, windowID, bounds.origin, &moveOwner) :
+            moveOneWindow(connection, windowID, probePoint, &moveOwner) :
             kCGErrorFailure;
+        if (moveError == kCGErrorSuccess) {
+            CGRect movedBounds = CGRectZero;
+            CGError readbackError = getWindowBounds(
+                connection, windowID, &movedBounds);
+            moveApplied = readbackError == kCGErrorSuccess &&
+                fabs(movedBounds.origin.x - probePoint.x) <= 0.5 &&
+                fabs(movedBounds.origin.y - probePoint.y) <= 0.5;
+
+            CGError restoreError = moveOneWindow(
+                connection, windowID, bounds.origin, NULL);
+            CGRect restoredBounds = CGRectZero;
+            CGError restoreReadbackError = restoreError == kCGErrorSuccess ?
+                getWindowBounds(connection, windowID, &restoredBounds) :
+                restoreError;
+            moveRestored = restoreReadbackError == kCGErrorSuccess &&
+                fabs(restoredBounds.origin.x - bounds.origin.x) <= 0.5 &&
+                fabs(restoredBounds.origin.y - bounds.origin.y) <= 0.5;
+            if (!moveApplied || !moveRestored) moveError = kCGErrorFailure;
+        }
     }
     if (moveOwner) setIntegerField(L, "move_owner_connection", moveOwner);
+    setBooleanField(L, "move_applied", moveApplied);
+    setBooleanField(L, "move_restored", moveRestored);
 
     bool directTransform = transformMode != NULL;
     bool directMove = moveError == kCGErrorSuccess;

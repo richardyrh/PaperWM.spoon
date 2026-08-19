@@ -1698,8 +1698,9 @@ end
 ---@return string|nil
 function Windows.nativeInteractiveStatus()
     local selection = selectNativeBackends()
-    if nativeMoveBackendEnabled() then return true, nil end
-    return false, native_move_error or native_helper_error or selection.reason
+    if selection.transform and nativeMoveBackendEnabled() then return true, nil end
+    return false, native_transform_error or native_move_error or
+        native_helper_error or selection.reason
 end
 
 ---report the cached native write-capability decision
@@ -1818,7 +1819,9 @@ function Windows.beginInteractiveMove(items, gesture_started)
     local native_check_started = Timer.absoluteTime()
     local preferred = {}
     for _, item in ipairs(items) do table.insert(preferred, item.window:id()) end
-    local native_enabled = nativeMoveBackendEnabled(preferred)
+    local selection = selectNativeBackends(preferred)
+    local native_enabled = selection.transform and
+        nativeMoveBackendEnabled(preferred)
     local native_check_ms = (Timer.absoluteTime() - native_check_started) / 1000000
     if not native_enabled then
         traceNativeAnimation(
@@ -3016,7 +3019,6 @@ function Windows.moveWindow(window, frame)
 
     local preferred = { id }
     local transform_enabled = nativeBackendEnabled(preferred)
-    local move_enabled = nativeMoveBackendEnabled(preferred)
     local current_frame = nativeBoundsBackendEnabled() and
         nativeBounds(id) or window:frame()
     local can_transform = current_frame.w > 0 and current_frame.h > 0
@@ -3024,10 +3026,6 @@ function Windows.moveWindow(window, frame)
     if can_transform and Window.animationDuration > 0 and transform_enabled then
         stopPositionAnimation(id)
         animateNativeFrame(window, current_frame, frame, watcher, generation)
-    elseif can_transform and sizesMatch(current_frame, frame) and
-        Window.animationDuration > 0 and move_enabled then
-        stopPositionAnimation(id)
-        animateNativeFrame(window, current_frame, frame, watcher, generation, true)
     elseif current_frame.w == frame.w and current_frame.h == frame.h and
         Window.animationDuration > 0 then
         stopNativeAnimation(id, true)

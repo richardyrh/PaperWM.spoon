@@ -436,6 +436,7 @@ local function slide_windows(self, space, screen_frame, gesture_started,
         tostring(compositor_active), tostring(swipe_blocked), #windows)
     if swipe_blocked then return "blocked" end
     for _, item in ipairs(windows) do
+        item.applied_x = item.frame and item.frame.x or item.x
         local watcher = self.state.ui_watchers[item.window:id()]
         if watcher then watcher:stop() end
     end
@@ -479,7 +480,10 @@ local function slide_windows(self, space, screen_frame, gesture_started,
             compositor_active = updated
         else
             for _, item in ipairs(windows) do
-                item.window:setTopLeft(item.frame.x, item.frame.y)
+                if math.abs(item.frame.x - item.applied_x) > 0.5 then
+                    item.window:setTopLeft(item.frame.x, item.frame.y)
+                    item.applied_x = item.frame.x
+                end
             end
         end
         return dx
