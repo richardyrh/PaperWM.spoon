@@ -235,7 +235,9 @@ local native_animation_uses_payload = false
 local scheduleNativeAnimationTransaction
 local scheduleNativeAnimationCompletion
 local animateNativeFrames
+local setWindowTopLeftImmediately
 local setWindowSizeImmediately
+local getWindowSizeImmediately
 local interactive_moves = nil
 local interactive_move_order = nil
 local interactive_move_direct = false
@@ -766,11 +768,13 @@ local function commitNativeRecord(record)
         end
         record.compensated_frame = real_frame
     end
+    local updates_disabled = false
     if not sizesMatch(real_frame, record.end_frame) then
         local now = Timer.secondsSinceEpoch()
         local should_resize = not record.resize_requested or
             now >= (record.next_resize_retry or 0)
         local resized, resize_error = true, nil
+        local accepted_size = nil
         if should_resize then
             -- Commit the real size after the presentation animation. Use the
             -- immediate primitive below so Hammerspoon cannot start or snap a
@@ -779,8 +783,16 @@ local function commitNativeRecord(record)
                 native_animation_profile.ax_resize_calls =
                     native_animation_profile.ax_resize_calls + 1
             end
+            -- Prevent WindowServer from presenting the new real size with the
+            -- old scale transform. The AX write is synchronous for the common
+            -- path, so hold screen updates through the native identity commit.
+            updates_disabled = select(1, nativeCall("beginUpdates"))
             resized, resize_error = setWindowSizeImmediately(
                 record.window, record.end_frame.w, record.end_frame.h)
+            if resized then
+                accepted_size, resize_error =
+                    getWindowSizeImmediately(record.window)
+            end
             record.resize_requested = true
             record.resize_attempts = (record.resize_attempts or 0) + 1
             local retry_delay = record.resize_retry_delay or 0.25
@@ -788,20 +800,34 @@ local function commitNativeRecord(record)
             record.resize_retry_delay = math.min(retry_delay * 2, 8)
         end
 
-        -- AX size writes can return before WindowServer publishes the new
-        -- bounds. Keep the presentation fixed at the target and let the
-        -- quarantine timer observe convergence instead of exposing the real
-        -- window or issuing a second animation.
-        local resized_frame = nativeBounds(record.id)
-        if resized_frame then real_frame = resized_frame end
-        if not resized or not sizesMatch(real_frame, record.end_frame) then
+        -- WindowServer bounds can remain stale while updates are disabled.
+        -- Prefer the application's immediate AX readback: it reports either
+        -- the requested size or the size imposed by its own constraints.
+        -- Fall back to deferred WindowServer polling only if AX cannot answer.
+        if accepted_size and accepted_size.w > 0 and accepted_size.h > 0 then
+            real_frame = hs.geometry.rect(
+                real_frame.x, real_frame.y, accepted_size.w, accepted_size.h)
+            if not sizesMatch(real_frame, record.end_frame) then
+                traceNativeAnimation(
+                    "resize handoff window=%d status=clamped accepted=%.0fx%.0f target=%.0fx%.0f",
+                    record.id, real_frame.w, real_frame.h,
+                    record.end_frame.w, record.end_frame.h)
+            end
+        else
+            local resized_frame = nativeBounds(record.id)
+            if resized_frame then real_frame = resized_frame end
+        end
+        if not resized or
+            (not accepted_size and not sizesMatch(real_frame, record.end_frame)) then
             retainNativeRecord(record, real_frame,
                 resize_error or "Accessibility size update pending")
+            if updates_disabled then nativeCall("endUpdates") end
             return false
         end
     end
 
     local settled, settle_error = settleNativeRecord(record, real_frame)
+    if updates_disabled then nativeCall("endUpdates") end
     if not settled then
         retainNativeRecord(record, real_frame, settle_error)
         return false
@@ -1348,6 +1374,17 @@ animateNativeFrames = function()
     end
 end
 
+setWindowTopLeftImmediately = function(window, x, y)
+    local setter = window._setTopLeft
+    if type(setter) ~= "function" then setter = window.setTopLeft end
+    if type(setter) ~= "function" then
+        return false, "window has no position setter"
+    end
+
+    local called, result = pcall(setter, window, { x = x, y = y })
+    return called and result ~= false, result
+end
+
 setWindowSizeImmediately = function(window, width, height)
     local setter = window._setSize
     if type(setter) ~= "function" then setter = window.setSize end
@@ -1355,6 +1392,111 @@ setWindowSizeImmediately = function(window, width, height)
 
     local called, result = pcall(setter, window, { w = width, h = height })
     return called and result ~= false, result
+end
+
+getWindowSizeImmediately = function(window)
+    local getter = window._size
+    if type(getter) ~= "function" then getter = window.size end
+    if type(getter) ~= "function" then return nil, "window has no size getter" end
+
+    local called, result = pcall(getter, window)
+    if not called then return nil, result end
+    if type(result) ~= "table" or
+        type(result.w) ~= "number" or type(result.h) ~= "number" then
+        return nil, "window returned an invalid size"
+    end
+    return result, nil
+end
+
+local function precommitNativeResize(window, id, real_frame, end_frame)
+    if sizesMatch(real_frame, end_frame) then return nil end
+
+    -- Resize the real window before the presentation animation, then conceal
+    -- that resize with the inverse compositor transform. The application only
+    -- receives one AX size write; the GPU expands that accepted backing size
+    -- from the old visible frame to its final dimensions.
+    local updates_disabled, update_error = nativeCall("beginUpdates")
+    if not updates_disabled then return nil, update_error end
+
+    -- Some applications (notably terminal emulators) clamp AXSize against
+    -- their AX position. A compositor-only move does not update that state,
+    -- so move through AX before resizing. WindowServer updates remain disabled
+    -- until the inverse transform conceals both writes.
+    if native_animation_profile then
+        native_animation_profile.ax_position_calls =
+            native_animation_profile.ax_position_calls + 1
+    end
+    local positioned, position_error = setWindowTopLeftImmediately(
+        window, end_frame.x, end_frame.y)
+    if not positioned then
+        nativeCall("endUpdates")
+        return nil, position_error or "Accessibility precommit move failed"
+    end
+
+    if native_animation_profile then
+        native_animation_profile.ax_resize_calls =
+            native_animation_profile.ax_resize_calls + 1
+    end
+    local resized, resize_error = setWindowSizeImmediately(
+        window, end_frame.w, end_frame.h)
+    local accepted_size, size_error = nil, nil
+    if resized then
+        accepted_size, size_error = getWindowSizeImmediately(window)
+    end
+
+    if not resized or not accepted_size or
+        accepted_size.w <= 0 or accepted_size.h <= 0 then
+        setWindowTopLeftImmediately(window, real_frame.x, real_frame.y)
+        nativeCall("endUpdates")
+        return nil, resize_error or size_error or
+            "Accessibility did not report the accepted size"
+    end
+
+    local resized_frame = hs.geometry.rect(
+        end_frame.x, end_frame.y,
+        accepted_size.w, accepted_size.h)
+    local accepted_end = hs.geometry.rect(
+        end_frame.x, end_frame.y, accepted_size.w, accepted_size.h)
+    local start_sx = real_frame.w / resized_frame.w
+    local start_sy = real_frame.h / resized_frame.h
+    local concealed, transform_error = nativeSet({ {
+        id = id,
+        base_x = resized_frame.x,
+        base_y = resized_frame.y,
+        sx = start_sx,
+        sy = start_sy,
+        tx = real_frame.x - (resized_frame.x * start_sx),
+        ty = real_frame.y - (resized_frame.y * start_sy),
+    } })
+    nativeCall("endUpdates")
+
+    if not concealed then
+        return {
+            real_frame = resized_frame,
+            end_frame = accepted_end,
+            start_x = resized_frame.x,
+            start_y = resized_frame.y,
+            start_sx = 1,
+            start_sy = 1,
+            concealed = false,
+        }, transform_error
+    end
+
+    local status = sizesMatch(accepted_size, end_frame) and
+        "precommitted" or "precommitted-clamped"
+    traceNativeAnimation(
+        "resize handoff window=%d status=%s accepted=%.0fx%.0f target=%.0fx%.0f",
+        id, status, accepted_size.w, accepted_size.h,
+        end_frame.w, end_frame.h)
+    return {
+        real_frame = resized_frame,
+        end_frame = accepted_end,
+        start_x = real_frame.x,
+        start_y = real_frame.y,
+        start_sx = start_sx,
+        start_sy = start_sy,
+        concealed = true,
+    }, nil
 end
 
 local function animateNativeFrame(window, real_frame, end_frame, watcher, generation, direct)
@@ -1376,6 +1518,32 @@ local function animateNativeFrame(window, real_frame, end_frame, watcher, genera
     local start_sy = previous and previous.sy or
         (quarantined and quarantined.end_frame.h / real_frame.h or 1)
     quarantined_windows[id] = nil
+
+    -- An inverse-transform resize is safe only before a fresh compositor
+    -- animation. An interrupted or quarantined window already has presentation
+    -- state that must be resolved by the existing final-handoff path.
+    local precommitted, precommit_error = nil, nil
+    if not direct and not previous and not quarantined then
+        precommitted, precommit_error = precommitNativeResize(
+            window, id, real_frame, end_frame)
+    end
+    if precommitted then
+        real_frame = precommitted.real_frame
+        end_frame = precommitted.end_frame
+        start_x = precommitted.start_x
+        start_y = precommitted.start_y
+        start_sx = precommitted.start_sx
+        start_sy = precommitted.start_sy
+        if not precommitted.concealed and Windows.PaperWM then
+            Windows.PaperWM.logger.wf(
+                "window %d resize could not be concealed: %s",
+                id, tostring(precommit_error))
+        end
+    elseif precommit_error then
+        traceNativeAnimation(
+            "resize handoff window=%d status=precommit-skipped reason=%s",
+            id, tostring(precommit_error))
+    end
 
     native_animations[id] = {
         id = id,
@@ -1754,7 +1922,7 @@ function Windows.performHapticFeedback()
     return false, native_haptic_error
 end
 
----start passive HID++ gesture-button and RawXY observation
+---start HID++ gesture-button and RawXY observation
 ---@param feature_index number
 ---@param cid number
 ---@return boolean
@@ -1787,7 +1955,7 @@ function Windows.pollHIDPPGesture()
     return sample, reason
 end
 
----stop passive HID++ observation
+---stop HID++ observation
 function Windows.stopHIDPPGestureMonitor()
     local helper = loadNativeHelper()
     if helper and type(helper.hidppMonitorStop) == "function" then

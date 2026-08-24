@@ -90,7 +90,7 @@ Config.swipe_gain = 1 ---@type number
 ---normalized touch travel before locking a trackpad swipe to an axis
 Config.swipe_direction_threshold = 0.01 ---@type number
 
----accept horizontal RawXY from a passively observed Logitech gesture button
+---accept horizontal RawXY from a Logitech gesture button
 Config.mouse_swipe = false ---@type boolean
 
 ---multiplier for HID++ RawXY deltas
@@ -102,7 +102,7 @@ Config.mouse_swipe_invert = false ---@type boolean
 ---accumulated RawXY travel before locking the gesture to an axis
 Config.mouse_swipe_direction_threshold = 1 ---@type number
 
----device-local HID++ feature index observed for REPROG_CONTROLS_V4
+---fallback HID++ feature index for REPROG_CONTROLS_V4
 Config.mouse_swipe_hidpp_feature_index = 0x09 ---@type number
 
 ---HID++ control ID for the MX Master 3 gesture button

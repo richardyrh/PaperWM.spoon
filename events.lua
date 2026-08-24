@@ -776,7 +776,7 @@ function Events.swipeHandler(self)
 end
 
 
----generate a poll callback for passive HID++ gesture-button RawXY
+---generate a poll callback for HID++ gesture-button RawXY
 ---@param self PaperWM
 function Events.mouseSwipePoll(self)
     local swipe_coro, horizontal = nil, nil
@@ -1024,7 +1024,7 @@ function Events.start()
                 Events.mouse_swipe_poll):start()
         else
             Events.PaperWM.logger.wf(
-                "could not start passive HID++ gesture monitor: %s",
+                "could not start HID++ gesture monitor: %s",
                 tostring(reason))
         end
     end

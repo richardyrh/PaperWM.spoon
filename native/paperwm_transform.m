@@ -1,6 +1,7 @@
 #include <ApplicationServices/ApplicationServices.h>
 #include <IOKit/hid/IOHIDKeys.h>
 #include <IOKit/hid/IOHIDManager.h>
+#include <IOKit/hid/IOHIDValue.h>
 #import <AppKit/NSHapticFeedback.h>
 #include <dlfcn.h>
 #include <math.h>
@@ -69,12 +70,33 @@ static char dockCapabilityError[256] = {0};
 
 #define HIDPP_LONG_REPORT 0x11
 #define HIDPP_SHORT_REPORT 0x10
-#define HIDPP_MAX_DEVICES 8
+#define HIDPP_VERY_LONG_REPORT 0x12
+#define HIDPP_MAX_DEVICES 16
 #define HIDPP_REPORT_SIZE 64
+#define HIDPP_CONTROL_SOFTWARE_ID 0x0f
+
+typedef enum {
+    HIDPP_CONTROL_IDLE = 0,
+    HIDPP_CONTROL_FEATURE_QUERY_SENT,
+    HIDPP_CONTROL_REPORTING_QUERY_SENT,
+    HIDPP_CONTROL_ENABLE_SENT,
+    HIDPP_CONTROL_ACTIVE,
+    HIDPP_CONTROL_ERROR,
+} HIDPPControlState;
 
 typedef struct {
     IOHIDDeviceRef device;
     uint8_t buffer[HIDPP_REPORT_SIZE];
+    uint8_t lastPacket[HIDPP_REPORT_SIZE];
+    CFIndex lastPacketLength;
+    CFAbsoluteTime lastPacketTime;
+    uint8_t lastPacketSource;
+    HIDPPControlState controlState;
+    uint8_t controlFeatureIndex;
+    bool controlPriorRawXY;
+    bool controlPriorKnown;
+    bool controlEnableSent;
+    bool bluetooth;
 } HIDPPDevice;
 
 static IOHIDManagerRef hidppManager = NULL;
@@ -83,6 +105,7 @@ static uint8_t hidppFeatureIndex = 0x09;
 static uint16_t hidppGestureCID = 0x00c3;
 static HIDPPDevice *hidppGestureSource = NULL;
 static uint8_t hidppGestureDeviceIndex = 0;
+static uint8_t hidppGestureFeatureIndex = 0;
 static bool hidppGestureDown = false;
 static bool hidppGestureBegan = false;
 static bool hidppGestureEnded = false;
@@ -92,6 +115,124 @@ static int32_t hidppAccumulatedY = 0;
 
 static int pushCGError(lua_State *L, CGError error);
 static bool transformsEqual(CGAffineTransform a, CGAffineTransform b);
+
+static bool hidppSendControlRequest(HIDPPDevice *source,
+                                    uint8_t featureIndex,
+                                    uint8_t function,
+                                    const uint8_t *params,
+                                    size_t paramLength) {
+    if (!source || !source->device || paramLength > 15) return false;
+    uint8_t report[20] = {0};
+    report[0] = HIDPP_LONG_REPORT;
+    report[1] = 0xff;
+    report[2] = featureIndex;
+    report[3] = (function & 0xf0) | HIDPP_CONTROL_SOFTWARE_ID;
+    if (params && paramLength) memcpy(report + 4, params, paramLength);
+    IOReturn result = IOHIDDeviceSetReport(
+        source->device, kIOHIDReportTypeOutput, HIDPP_LONG_REPORT,
+        report, sizeof(report));
+    if (result == kIOReturnSuccess) return true;
+    source->controlState = HIDPP_CONTROL_ERROR;
+    return false;
+}
+
+static void hidppStartControlProbe(HIDPPDevice *source) {
+    if (!source || !source->bluetooth || !source->device ||
+        source->controlState != HIDPP_CONTROL_IDLE) return;
+    uint8_t feature[2] = {0x1b, 0x04};
+    source->controlState = HIDPP_CONTROL_FEATURE_QUERY_SENT;
+    hidppSendControlRequest(source, 0x00, 0x00, feature, sizeof(feature));
+}
+
+static void hidppProcessControlReply(HIDPPDevice *source,
+                                     const uint8_t *packet,
+                                     CFIndex packetLength) {
+    if (!source || !packet || packetLength < 6 ||
+        source->controlState == HIDPP_CONTROL_IDLE ||
+        source->controlState == HIDPP_CONTROL_ACTIVE ||
+        source->controlState == HIDPP_CONTROL_ERROR) return;
+
+    uint8_t expectedFeature = source->controlState ==
+        HIDPP_CONTROL_FEATURE_QUERY_SENT ? 0x00 : source->controlFeatureIndex;
+    uint8_t expectedFunction = 0x30;
+    if (source->controlState == HIDPP_CONTROL_FEATURE_QUERY_SENT) {
+        expectedFunction = 0x00;
+    } else if (source->controlState == HIDPP_CONTROL_REPORTING_QUERY_SENT) {
+        expectedFunction = 0x20;
+    }
+    uint8_t expectedFunctionAndSoftwareID =
+        expectedFunction | HIDPP_CONTROL_SOFTWARE_ID;
+
+    if (packet[2] == 0xff && packetLength >= 6 &&
+        packet[3] == expectedFeature &&
+        packet[4] == expectedFunctionAndSoftwareID) {
+        source->controlState = HIDPP_CONTROL_ERROR;
+        return;
+    }
+    if (packet[2] != expectedFeature ||
+        packet[3] != expectedFunctionAndSoftwareID) return;
+
+    if (source->controlState == HIDPP_CONTROL_FEATURE_QUERY_SENT) {
+        source->controlFeatureIndex = packet[4];
+        if (source->controlFeatureIndex == 0) {
+            source->controlState = HIDPP_CONTROL_ERROR;
+            return;
+        }
+        uint8_t cid[2] = {
+            (uint8_t)(hidppGestureCID >> 8),
+            (uint8_t)(hidppGestureCID & 0xff),
+        };
+        source->controlState = HIDPP_CONTROL_REPORTING_QUERY_SENT;
+        hidppSendControlRequest(source, source->controlFeatureIndex,
+                                0x20, cid, sizeof(cid));
+        return;
+    }
+
+    if (source->controlState == HIDPP_CONTROL_ENABLE_SENT) {
+        source->controlState = HIDPP_CONTROL_ACTIVE;
+        return;
+    }
+
+    if (packetLength < 9) {
+        source->controlState = HIDPP_CONTROL_ERROR;
+        return;
+    }
+    uint16_t cid = ((uint16_t)packet[4] << 8) | packet[5];
+    if (cid != hidppGestureCID) {
+        source->controlState = HIDPP_CONTROL_ERROR;
+        return;
+    }
+    source->controlPriorRawXY = (packet[6] & 0x10) != 0;
+    source->controlPriorKnown = true;
+
+    // Change only RawXY diversion. 0x20 marks that bit as valid and 0x10
+    // enables it; the ordinary diversion and remapping fields remain untouched.
+    uint8_t reporting[5] = {
+        (uint8_t)(hidppGestureCID >> 8),
+        (uint8_t)(hidppGestureCID & 0xff),
+        0x30,
+        0x00,
+        0x00,
+    };
+    source->controlState = HIDPP_CONTROL_ENABLE_SENT;
+    source->controlEnableSent = true;
+    hidppSendControlRequest(source, source->controlFeatureIndex,
+                            0x30, reporting, sizeof(reporting));
+}
+
+static void hidppRestoreRawXY(HIDPPDevice *source) {
+    if (!source || !source->device || !source->controlPriorKnown ||
+        !source->controlEnableSent) return;
+    uint8_t reporting[5] = {
+        (uint8_t)(hidppGestureCID >> 8),
+        (uint8_t)(hidppGestureCID & 0xff),
+        source->controlPriorRawXY ? 0x30 : 0x20,
+        0x00,
+        0x00,
+    };
+    hidppSendControlRequest(source, source->controlFeatureIndex,
+                            0x30, reporting, sizeof(reporting));
+}
 
 static const char *nativeRouteName(NativeRoute route) {
     switch (route) {
@@ -146,6 +287,115 @@ static int pushNativeRouteError(lua_State *L,
     return 2;
 }
 
+static HIDPPDevice *hidppDeviceForRef(IOHIDDeviceRef device) {
+    for (int i = 0; i < HIDPP_MAX_DEVICES; i++) {
+        if (hidppDevices[i].device == device) return &hidppDevices[i];
+    }
+    return NULL;
+}
+
+static bool hidppNormalizeReport(uint32_t reportID,
+                                 const uint8_t *report,
+                                 CFIndex length,
+                                 uint8_t *packet,
+                                 CFIndex *packetLength) {
+    if (!report || !packet || !packetLength || length <= 0) return false;
+
+    if (report[0] == HIDPP_SHORT_REPORT ||
+        report[0] == HIDPP_LONG_REPORT ||
+        report[0] == HIDPP_VERY_LONG_REPORT) {
+        if (length > HIDPP_REPORT_SIZE) length = HIDPP_REPORT_SIZE;
+        memcpy(packet, report, (size_t)length);
+        *packetLength = length;
+        return true;
+    }
+
+    if (reportID != HIDPP_SHORT_REPORT &&
+        reportID != HIDPP_LONG_REPORT &&
+        reportID != HIDPP_VERY_LONG_REPORT) {
+        return false;
+    }
+    if (length >= HIDPP_REPORT_SIZE) length = HIDPP_REPORT_SIZE - 1;
+    packet[0] = (uint8_t)reportID;
+    memcpy(packet + 1, report, (size_t)length);
+    *packetLength = length + 1;
+    return true;
+}
+
+static void hidppProcessReport(HIDPPDevice *source,
+                               uint32_t reportID,
+                               const uint8_t *report,
+                               CFIndex length,
+                               uint8_t packetSource) {
+    uint8_t packet[HIDPP_REPORT_SIZE] = {0};
+    CFIndex packetLength = 0;
+    if (!source || !hidppNormalizeReport(
+            reportID, report, length, packet, &packetLength)) return;
+
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (source->lastPacketSource != packetSource &&
+        source->lastPacketLength == packetLength &&
+        now - source->lastPacketTime <= 0.002 &&
+        memcmp(source->lastPacket, packet, (size_t)packetLength) == 0) {
+        return;
+    }
+    memcpy(source->lastPacket, packet, (size_t)packetLength);
+    source->lastPacketLength = packetLength;
+    source->lastPacketTime = now;
+    source->lastPacketSource = packetSource;
+    hidppProcessControlReply(source, packet, packetLength);
+    if (packetLength < 6) return;
+
+    uint8_t featureIndex = packet[2];
+    if (packet[3] == 0x00) {
+        if (source->controlFeatureIndex &&
+            featureIndex != source->controlFeatureIndex) return;
+        bool gestureCIDIsPressed = false;
+        CFIndex pressedListEnd = packetLength < 12 ? packetLength : 12;
+        for (CFIndex offset = 4; offset + 1 < pressedListEnd; offset += 2) {
+            uint16_t cid = ((uint16_t)packet[offset] << 8) |
+                packet[offset + 1];
+            if (cid == hidppGestureCID) {
+                gestureCIDIsPressed = true;
+                break;
+            }
+        }
+        if (gestureCIDIsPressed && !hidppGestureDown) {
+            hidppGestureSource = source;
+            hidppGestureDeviceIndex = packet[1];
+            hidppGestureFeatureIndex = featureIndex;
+            hidppGestureDown = true;
+            hidppGestureBegan = true;
+            hidppGestureEnded = false;
+            hidppDiscardNextRaw = true;
+            hidppAccumulatedX = 0;
+            hidppAccumulatedY = 0;
+        } else if (!gestureCIDIsPressed && hidppGestureDown &&
+                   source == hidppGestureSource &&
+                   packet[1] == hidppGestureDeviceIndex &&
+                   featureIndex == hidppGestureFeatureIndex) {
+            hidppGestureDown = false;
+            hidppGestureEnded = true;
+            hidppDiscardNextRaw = false;
+        }
+        return;
+    }
+
+    if ((packet[3] & 0xf0) == 0x10 && hidppGestureDown &&
+        packetLength >= 8 && source == hidppGestureSource &&
+        packet[1] == hidppGestureDeviceIndex &&
+        featureIndex == hidppGestureFeatureIndex) {
+        int16_t dx = (int16_t)(((uint16_t)packet[4] << 8) | packet[5]);
+        int16_t dy = (int16_t)(((uint16_t)packet[6] << 8) | packet[7]);
+        if (hidppDiscardNextRaw) {
+            hidppDiscardNextRaw = false;
+        } else {
+            hidppAccumulatedX += dx;
+            hidppAccumulatedY += dy;
+        }
+    }
+}
+
 static void hidppInputReport(void *context,
                              IOReturn result,
                              void *sender,
@@ -154,45 +404,31 @@ static void hidppInputReport(void *context,
                              uint8_t *report,
                              CFIndex length) {
     (void)sender;
-    (void)type;
-    (void)reportID;
-    if (result != kIOReturnSuccess || length < 6) return;
-    if (report[0] != HIDPP_LONG_REPORT && report[0] != HIDPP_SHORT_REPORT) return;
-    if (report[2] != hidppFeatureIndex) return;
+    if (result != kIOReturnSuccess || type != kIOHIDReportTypeInput) return;
+    HIDPPDevice *source = context;
+    if (!source) return;
+    hidppProcessReport(source, reportID, report, length, 1);
+}
 
-    if (report[3] == 0x00) {
-        uint16_t cid = ((uint16_t)report[4] << 8) | report[5];
-        if (cid == hidppGestureCID && !hidppGestureDown) {
-            hidppGestureSource = context;
-            hidppGestureDeviceIndex = report[1];
-            hidppGestureDown = true;
-            hidppGestureBegan = true;
-            hidppGestureEnded = false;
-            hidppDiscardNextRaw = true;
-            hidppAccumulatedX = 0;
-            hidppAccumulatedY = 0;
-        } else if (cid == 0 && hidppGestureDown &&
-                   context == hidppGestureSource &&
-                   report[1] == hidppGestureDeviceIndex) {
-            hidppGestureDown = false;
-            hidppGestureEnded = true;
-            hidppDiscardNextRaw = false;
-        }
-        return;
-    }
+static void hidppInputValue(void *context,
+                            IOReturn result,
+                            void *sender,
+                            IOHIDValueRef value) {
+    (void)context;
+    (void)sender;
+    if (result != kIOReturnSuccess || !value) return;
+    IOHIDElementRef element = IOHIDValueGetElement(value);
+    IOHIDDeviceRef device = element ? IOHIDElementGetDevice(element) : NULL;
+    HIDPPDevice *source = hidppDeviceForRef(device);
+    if (!source || !source->bluetooth) return;
 
-    if ((report[3] & 0xf0) == 0x10 && hidppGestureDown && length >= 8 &&
-        context == hidppGestureSource &&
-        report[1] == hidppGestureDeviceIndex) {
-        int16_t dx = (int16_t)(((uint16_t)report[4] << 8) | report[5]);
-        int16_t dy = (int16_t)(((uint16_t)report[6] << 8) | report[7]);
-        if (hidppDiscardNextRaw) {
-            hidppDiscardNextRaw = false;
-        } else {
-            hidppAccumulatedX += dx;
-            hidppAccumulatedY += dy;
-        }
-    }
+    uint32_t reportID = element ? IOHIDElementGetReportID(element) : 0;
+    if (reportID != HIDPP_SHORT_REPORT &&
+        reportID != HIDPP_LONG_REPORT &&
+        reportID != HIDPP_VERY_LONG_REPORT) return;
+    CFIndex length = IOHIDValueGetLength(value);
+    const uint8_t *bytes = IOHIDValueGetBytePtr(value);
+    hidppProcessReport(source, reportID, bytes, length, 2);
 }
 
 static void hidppDeviceMatched(void *context,
@@ -208,14 +444,18 @@ static void hidppDeviceMatched(void *context,
     }
     for (int i = 0; i < HIDPP_MAX_DEVICES; i++) {
         if (hidppDevices[i].device) continue;
-        if (IOHIDDeviceOpen(device, kIOHIDOptionsTypeNone) != kIOReturnSuccess) return;
-
         hidppDevices[i].device = device;
+        hidppDevices[i].controlFeatureIndex = hidppFeatureIndex;
+        CFTypeRef transport = IOHIDDeviceGetProperty(
+            device, CFSTR(kIOHIDTransportKey));
+        hidppDevices[i].bluetooth = transport &&
+            CFGetTypeID(transport) == CFStringGetTypeID() &&
+            CFStringFind((CFStringRef)transport, CFSTR("Bluetooth"),
+                         kCFCompareCaseInsensitive).location != kCFNotFound;
         IOHIDDeviceRegisterInputReportCallback(
             device, hidppDevices[i].buffer, sizeof(hidppDevices[i].buffer),
             hidppInputReport, &hidppDevices[i]);
-        IOHIDDeviceScheduleWithRunLoop(
-            device, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
+        hidppStartControlProbe(&hidppDevices[i]);
         return;
     }
 }
@@ -229,16 +469,17 @@ static void hidppDeviceRemoved(void *context,
     (void)sender;
     for (int i = 0; i < HIDPP_MAX_DEVICES; i++) {
         if (hidppDevices[i].device != device) continue;
-        IOHIDDeviceUnscheduleFromRunLoop(
-            device, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
-        IOHIDDeviceClose(device, kIOHIDOptionsTypeNone);
+        IOHIDDeviceRegisterInputReportCallback(
+            device, hidppDevices[i].buffer, sizeof(hidppDevices[i].buffer),
+            NULL, NULL);
         if (&hidppDevices[i] == hidppGestureSource) {
             if (hidppGestureDown) hidppGestureEnded = true;
             hidppGestureDown = false;
             hidppGestureSource = NULL;
             hidppGestureDeviceIndex = 0;
+            hidppGestureFeatureIndex = 0;
         }
-        hidppDevices[i].device = NULL;
+        memset(&hidppDevices[i], 0, sizeof(hidppDevices[i]));
         return;
     }
 }
@@ -249,6 +490,7 @@ static int hidppMonitorStart(lua_State *L) {
     hidppGestureDown = false;
     hidppGestureSource = NULL;
     hidppGestureDeviceIndex = 0;
+    hidppGestureFeatureIndex = 0;
     hidppGestureBegan = false;
     hidppGestureEnded = false;
     hidppDiscardNextRaw = false;
@@ -285,6 +527,8 @@ static int hidppMonitorStart(lua_State *L) {
         hidppManager, hidppDeviceMatched, NULL);
     IOHIDManagerRegisterDeviceRemovalCallback(
         hidppManager, hidppDeviceRemoved, NULL);
+    IOHIDManagerRegisterInputValueCallback(
+        hidppManager, hidppInputValue, NULL);
     IOHIDManagerScheduleWithRunLoop(
         hidppManager, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
 
@@ -332,23 +576,30 @@ static int hidppMonitorPoll(lua_State *L) {
 static int hidppMonitorStop(lua_State *L) {
     (void)L;
     if (hidppManager) {
+        IOHIDManagerRegisterDeviceMatchingCallback(hidppManager, NULL, NULL);
+        IOHIDManagerRegisterDeviceRemovalCallback(hidppManager, NULL, NULL);
+        IOHIDManagerRegisterInputValueCallback(hidppManager, NULL, NULL);
         for (int i = 0; i < HIDPP_MAX_DEVICES; i++) {
-            IOHIDDeviceRef device = hidppDevices[i].device;
-            if (!device) continue;
-            IOHIDDeviceUnscheduleFromRunLoop(
-                device, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
-            IOHIDDeviceClose(device, kIOHIDOptionsTypeNone);
-            hidppDevices[i].device = NULL;
+            if (!hidppDevices[i].device) continue;
+            hidppRestoreRawXY(&hidppDevices[i]);
+            IOHIDDeviceRegisterInputReportCallback(
+                hidppDevices[i].device,
+                hidppDevices[i].buffer,
+                sizeof(hidppDevices[i].buffer),
+                NULL,
+                NULL);
         }
         IOHIDManagerUnscheduleFromRunLoop(
             hidppManager, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
         IOHIDManagerClose(hidppManager, kIOHIDOptionsTypeNone);
         CFRelease(hidppManager);
         hidppManager = NULL;
+        memset(hidppDevices, 0, sizeof(hidppDevices));
     }
     hidppGestureDown = false;
     hidppGestureSource = NULL;
     hidppGestureDeviceIndex = 0;
+    hidppGestureFeatureIndex = 0;
     hidppGestureBegan = false;
     hidppGestureEnded = false;
     hidppDiscardNextRaw = false;
