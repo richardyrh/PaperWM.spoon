@@ -20,6 +20,9 @@ _G.PaperWMNativeAnimationCleanup = nil
 local position_animations = {}
 local position_animation_timer = nil
 local move_generations = {}
+local live_reflow = nil
+local live_reflow_ax_dirty = {}
+local live_reflow_watchers = {}
 local focus_guard_target = nil
 local focus_guard_timer = nil
 local focus_guard_generation = 0
@@ -228,6 +231,9 @@ local native_haptic = nil
 local native_haptic_checked = false
 local native_haptic_error = nil
 local native_animations = {}
+-- Preserve the current presentation when a drag adopts a running animation.
+local parked_presentations = {}
+local parked_visual_presentations = {}
 local native_animation_timer = nil
 local native_animation_batch_timer = nil
 local native_animation_completion_timer = nil
@@ -238,6 +244,8 @@ local animateNativeFrames
 local setWindowTopLeftImmediately
 local setWindowSizeImmediately
 local getWindowSizeImmediately
+local suppressAXResizeAnimation
+local retryStickyFrameResize
 local interactive_moves = nil
 local interactive_move_order = nil
 local interactive_move_direct = false
@@ -249,6 +257,7 @@ local last_interactive_profile = nil
 local native_animation_profile = nil
 local last_native_animation_profile = nil
 local pending_keyboard_navigation = nil
+local last_keyboard_navigation = nil
 
 local function resetNativeBackendSelection()
     native_backend_selection = {
@@ -281,7 +290,8 @@ local function beginNativeAnimationProfile()
         ax_resize_calls = 0,
     }
     if pending_keyboard_navigation and
-        pending_keyboard_navigation.focus_event_at then
+        (pending_keyboard_navigation.focus_event_at or
+            pending_keyboard_navigation.prelayout_started) then
         native_animation_profile.keyboard = pending_keyboard_navigation
         pending_keyboard_navigation = nil
     end
@@ -309,7 +319,9 @@ local function finishNativeAnimationProfile(status)
         ((keyboard.focus_event_at - keyboard.requested_at) / 1000000) or 0
     profile.focus_call_ms = keyboard and keyboard.focus_call_ms or 0
     profile.layout_ms = keyboard and keyboard.layout_complete_at and
-        ((keyboard.layout_complete_at - keyboard.focus_event_at) / 1000000) or 0
+        ((keyboard.layout_complete_at -
+            (keyboard.layout_started_at or keyboard.focus_event_at or
+                keyboard.requested_at)) / 1000000) or 0
     profile.keyboard = nil
     profile.window_ids = nil
     last_native_animation_profile = profile
@@ -601,16 +613,24 @@ local function sizesMatch(a, b)
     return a and math.abs(a.w - b.w) <= 1 and math.abs(a.h - b.h) <= 1
 end
 
+local function unchangedResizeDimensions(before, after, target)
+    return math.abs(after.w - before.w) <= 1 and math.abs(after.w - target.w) > 1,
+        math.abs(after.h - before.h) <= 1 and math.abs(after.h - target.h) > 1
+end
+
 local function framesMatch(a, b)
     return a and sizesMatch(a, b) and
         math.abs(a.x - b.x) <= 1 and math.abs(a.y - b.y) <= 1
 end
+
 
 local function targetTransform(record, real_frame)
     local sx = record.end_frame.w / real_frame.w
     local sy = record.end_frame.h / real_frame.h
     return {
         id = record.id,
+        base_x = real_frame.x,
+        base_y = real_frame.y,
         sx = sx,
         sy = sy,
         tx = record.end_frame.x - (real_frame.x * sx),
@@ -758,6 +778,10 @@ local function commitNativeRecord(record)
         retainNativeRecord(record, nil, "WindowServer reported empty bounds")
         return false
     end
+    if record.unchanged_size and not sizesMatch(record.unchanged_size, real_frame) then
+        record.unchanged_size = nil
+        record.unchanged_size_since = nil
+    end
 
     if not framesMatch(record.compensated_frame, real_frame) then
         local transformed, transform_error =
@@ -769,6 +793,7 @@ local function commitNativeRecord(record)
         record.compensated_frame = real_frame
     end
     local updates_disabled = false
+    local restore_ax_animation = nil
     if not sizesMatch(real_frame, record.end_frame) then
         local now = Timer.secondsSinceEpoch()
         local should_resize = not record.resize_requested or
@@ -787,11 +812,14 @@ local function commitNativeRecord(record)
             -- old scale transform. The AX write is synchronous for the common
             -- path, so hold screen updates through the native identity commit.
             updates_disabled = select(1, nativeCall("beginUpdates"))
+            restore_ax_animation = suppressAXResizeAnimation(record.window)
             resized, resize_error = setWindowSizeImmediately(
                 record.window, record.end_frame.w, record.end_frame.h)
             if resized then
                 accepted_size, resize_error =
                     getWindowSizeImmediately(record.window)
+                accepted_size = retryStickyFrameResize(record.window,
+                    record.id, real_frame, record.end_frame, accepted_size)
             end
             record.resize_requested = true
             record.resize_attempts = (record.resize_attempts or 0) + 1
@@ -800,10 +828,26 @@ local function commitNativeRecord(record)
             record.resize_retry_delay = math.min(retry_delay * 2, 8)
         end
 
+        -- An unchanged AX readback can be the old size, not a constraint.
+        -- Keep the requested destination until the app catches up. If the app
+        -- consistently refuses the size, allow its stable constraint after a
+        -- bounded grace period instead of leaving it stretched indefinitely.
+        local width_pending, height_pending = false, false
+        if accepted_size then
+            width_pending, height_pending = unchangedResizeDimensions(
+                real_frame, accepted_size, record.end_frame)
+        end
+        if width_pending or height_pending then
+            record.unchanged_size = accepted_size
+            record.unchanged_size_since = record.unchanged_size_since or now
+            if now - record.unchanged_size_since < 0.5 then
+                accepted_size = nil
+                resize_error = "Accessibility returned the pre-resize size"
+            end
+        end
+
         -- WindowServer bounds can remain stale while updates are disabled.
-        -- Prefer the application's immediate AX readback: it reports either
-        -- the requested size or the size imposed by its own constraints.
-        -- Fall back to deferred WindowServer polling only if AX cannot answer.
+        -- Use a changed AX readback, but defer an old or unavailable readback.
         if accepted_size and accepted_size.w > 0 and accepted_size.h > 0 then
             real_frame = hs.geometry.rect(
                 real_frame.x, real_frame.y, accepted_size.w, accepted_size.h)
@@ -821,12 +865,30 @@ local function commitNativeRecord(record)
             (not accepted_size and not sizesMatch(real_frame, record.end_frame)) then
             retainNativeRecord(record, real_frame,
                 resize_error or "Accessibility size update pending")
+            if restore_ax_animation then restore_ax_animation() end
             if updates_disabled then nativeCall("endUpdates") end
             return false
         end
     end
 
+    if record.ax_sync then
+        -- Reconcile the application's position only after the release
+        -- animation, while its final presentation is still concealed.
+        if not updates_disabled then
+            updates_disabled = select(1, nativeCall("beginUpdates"))
+        end
+        local positioned, position_error = setWindowTopLeftImmediately(
+            record.window, record.end_frame.x, record.end_frame.y)
+        if not positioned then
+            retainNativeRecord(record, real_frame, position_error)
+            if restore_ax_animation then restore_ax_animation() end
+            if updates_disabled then nativeCall("endUpdates") end
+            return false
+        end
+        record.ax_sync = nil
+    end
     local settled, settle_error = settleNativeRecord(record, real_frame)
+    if restore_ax_animation then restore_ax_animation() end
     if updates_disabled then nativeCall("endUpdates") end
     if not settled then
         retainNativeRecord(record, real_frame, settle_error)
@@ -839,12 +901,15 @@ local function commitNativeRecord(record)
             (Timer.absoluteTime() - record.resize_deferred_at) / 1000000)
     end
     quarantined_windows[record.id] = nil
+    live_reflow_ax_dirty[record.id] = nil
     record.compensated_frame = nil
     record.resize_requested = nil
     record.next_resize_retry = nil
     record.resize_retry_delay = nil
     record.resize_attempts = nil
     record.resize_deferred_at = nil
+    record.unchanged_size = nil
+    record.unchanged_size_since = nil
     return true
 end
 
@@ -867,6 +932,8 @@ local function commitNativeAnimations(records, set_real_positions)
 
     for _, animation in ipairs(records) do
         native_animations[animation.id] = nil
+        parked_presentations[animation.id] = nil
+        parked_visual_presentations[animation.id] = nil
         if animation.direct then
             local target = set_real_positions and animation.end_frame or
                 animation.real_frame
@@ -923,7 +990,10 @@ local function finishNativePayloadRecords(records)
         if record.payload_auto_commit and
             framesMatch(frames[record.id], record.end_frame) then
             native_animations[record.id] = nil
+            parked_presentations[record.id] = nil
+            parked_visual_presentations[record.id] = nil
             quarantined_windows[record.id] = nil
+            live_reflow_ax_dirty[record.id] = nil
             restartWatcherAfter(watcher_restart_padding, record.id,
                 record.watcher, record.generation)
         else
@@ -1168,7 +1238,8 @@ local function startNativeAnimationTransaction()
     end
 
     native_animation_uses_payload = false
-    native_backend_selection.animation = false
+    -- A failed request does not revoke the payload's animation capability.
+    -- Let the native client reconnect on the next batch after Dock reinjects.
     if native_animation_profile then
         native_animation_profile.error = reason
     end
@@ -1240,6 +1311,15 @@ scheduleNativeAnimationTransaction = function()
     native_animation_batch_timer = Timer.doAfter(0, startNativeAnimationTransaction)
 end
 
+---submit an already batched native layout without waiting for another run-loop turn
+function Windows.flushNativeAnimationBatch()
+    if not native_animation_batch_timer then return false end
+    native_animation_batch_timer:stop()
+    native_animation_batch_timer = nil
+    startNativeAnimationTransaction()
+    return true
+end
+
 animateNativeFrames = function()
     local now = Timer.secondsSinceEpoch()
     local transforms, transform_records, moves = {}, {}, {}
@@ -1252,8 +1332,10 @@ animateNativeFrames = function()
         else
             local progress = math.min(1, (now - animation.started_at) / animation.duration)
             local eased = easeProgress(progress)
-            animation.x = animation.start_x + ((animation.end_frame.x - animation.start_x) * eased)
-            animation.y = animation.start_y + ((animation.end_frame.y - animation.start_y) * eased)
+            animation.x = animation.start_x +
+                ((animation.end_frame.x - animation.start_x) * eased)
+            animation.y = animation.start_y +
+                ((animation.end_frame.y - animation.start_y) * eased)
             animation.sx = animation.start_sx + ((animation.end_sx - animation.start_sx) * eased)
             animation.sy = animation.start_sy + ((animation.end_sy - animation.start_sy) * eased)
 
@@ -1408,8 +1490,120 @@ getWindowSizeImmediately = function(window)
     return result, nil
 end
 
+suppressAXResizeAnimation = function(window)
+    -- Enhanced UI makes some applications animate AX writes themselves. That
+    -- races the inverse GPU transform and can expose the destination frame
+    -- before our animation starts. Suppress it only for this real-frame write;
+    -- do not permanently change the application's accessibility state.
+    local called, ax_app = pcall(function()
+        local app = window:application()
+        return app and hs.axuielement.applicationElement(app)
+    end)
+    if not called or not ax_app then return nil end
+    local read, enhanced = pcall(function()
+        return ax_app:attributeValue("AXEnhancedUserInterface")
+    end)
+    if not read or enhanced ~= true then return nil end
+    local disabled, result = pcall(function()
+        return ax_app:setAttributeValue("AXEnhancedUserInterface", false)
+    end)
+    if not disabled or not result then return nil end
+    return function()
+        pcall(function()
+            ax_app:setAttributeValue("AXEnhancedUserInterface", true)
+        end)
+    end
+end
+
+retryStickyFrameResize = function(window, id, real_frame, end_frame, accepted_size)
+    if not accepted_size then return nil end
+    local width_pending, height_pending = unchangedResizeDimensions(
+        real_frame, accepted_size, end_frame)
+    if not width_pending and not height_pending then return accepted_size end
+    if type(window.setFrameWithWorkarounds) ~= "function" then return accepted_size end
+
+    -- A small reduction at a screen edge can be ignored by macOS even when
+    -- the app is responsive. Reuse Hammerspoon's safe-area correction rather
+    -- than misclassifying that sticky edge as the application's minimum size.
+    -- Both callers hold screen updates and suppress app-side AX animation;
+    -- duration zero also prevents Hammerspoon from starting a second animator.
+    if native_animation_profile then
+        -- The instant workaround writes size/position/size in a safe area,
+        -- then size/position/size at the requested destination.
+        native_animation_profile.ax_position_calls =
+            native_animation_profile.ax_position_calls + 2
+        native_animation_profile.ax_resize_calls =
+            native_animation_profile.ax_resize_calls + 4
+    end
+    local called, result = pcall(
+        window.setFrameWithWorkarounds, window, end_frame, 0)
+    local corrected_size, size_error
+    if called and result then corrected_size, size_error = getWindowSizeImmediately(window) end
+    if corrected_size and corrected_size.w > 0 and corrected_size.h > 0 then
+        traceNativeAnimation(
+            "resize handoff window=%d status=edge-workaround before=%.0fx%.0f accepted=%.0fx%.0f target=%.0fx%.0f",
+            id, accepted_size.w, accepted_size.h,
+            corrected_size.w, corrected_size.h, end_frame.w, end_frame.h)
+        return corrected_size
+    end
+    traceNativeAnimation(
+        "resize handoff window=%d status=edge-workaround-failed reason=%s",
+        id, tostring(size_error or result))
+    return accepted_size
+end
+
 local function precommitNativeResize(window, id, real_frame, end_frame)
     if sizesMatch(real_frame, end_frame) then return nil end
+
+    -- Keep the AX position/size write, accepted-size readback and inverse
+    -- compositor transform behind one native call when the current helper
+    -- supports it. Older helpers retain the Lua handoff below.
+    local helper = loadNativeHelper()
+    if (Windows.PaperWM.resize_handoff_backend == "native" or
+        Windows.PaperWM.resize_handoff_backend == "service") and
+        helper and type(helper.prepareResize) == "function" and
+        nativeDisplayLinkEnabled() then
+        local app = window:application()
+        local pid = app and app:pid()
+        if pid then
+            local prepared, result = nativeHelperCall("prepareResize", {
+                id = id, pid = pid,
+                service = Windows.PaperWM.resize_handoff_backend == "service",
+                timeout = tonumber(Windows.PaperWM.ax_timeout) or 0.2,
+                start_x = real_frame.x, start_y = real_frame.y,
+                start_w = real_frame.w, start_h = real_frame.h,
+                end_x = end_frame.x, end_y = end_frame.y,
+                end_w = end_frame.w, end_h = end_frame.h,
+            })
+            if prepared then
+                local accepted = hs.geometry.rect(end_frame.x, end_frame.y,
+                    result.accepted_w, result.accepted_h)
+                local width_pending, height_pending = unchangedResizeDimensions(
+                    real_frame, accepted, end_frame)
+                local accepted_end = hs.geometry.rect(end_frame.x, end_frame.y,
+                    width_pending and end_frame.w or accepted.w,
+                    height_pending and end_frame.h or accepted.h)
+                traceNativeAnimation(
+                    "resize handoff window=%d status=%s-precommitted accepted=%.0fx%.0f target=%.0fx%.0f concealed=%s",
+                    id, Windows.PaperWM.resize_handoff_backend,
+                    accepted.w, accepted.h, end_frame.w, end_frame.h,
+                    tostring(result.concealed))
+                return {
+                    real_frame = accepted,
+                    end_frame = accepted_end,
+                    start_x = real_frame.x,
+                    start_y = real_frame.y,
+                    start_sx = real_frame.w / accepted.w,
+                    start_sy = real_frame.h / accepted.h,
+                    concealed = result.concealed,
+                }, result.transform_error
+            end
+            traceNativeAnimation(
+                "resize handoff window=%d status=%s-precommit-fallback reason=%s",
+                id, Windows.PaperWM.resize_handoff_backend,
+                tostring(result))
+        end
+    end
 
     -- Resize the real window before the presentation animation, then conceal
     -- that resize with the inverse compositor transform. The application only
@@ -1417,6 +1611,7 @@ local function precommitNativeResize(window, id, real_frame, end_frame)
     -- from the old visible frame to its final dimensions.
     local updates_disabled, update_error = nativeCall("beginUpdates")
     if not updates_disabled then return nil, update_error end
+    local restore_ax_animation = suppressAXResizeAnimation(window)
 
     -- Some applications (notably terminal emulators) clamp AXSize against
     -- their AX position. A compositor-only move does not update that state,
@@ -1429,6 +1624,7 @@ local function precommitNativeResize(window, id, real_frame, end_frame)
     local positioned, position_error = setWindowTopLeftImmediately(
         window, end_frame.x, end_frame.y)
     if not positioned then
+        if restore_ax_animation then restore_ax_animation() end
         nativeCall("endUpdates")
         return nil, position_error or "Accessibility precommit move failed"
     end
@@ -1442,11 +1638,14 @@ local function precommitNativeResize(window, id, real_frame, end_frame)
     local accepted_size, size_error = nil, nil
     if resized then
         accepted_size, size_error = getWindowSizeImmediately(window)
+        accepted_size = retryStickyFrameResize(
+            window, id, real_frame, end_frame, accepted_size)
     end
 
     if not resized or not accepted_size or
         accepted_size.w <= 0 or accepted_size.h <= 0 then
         setWindowTopLeftImmediately(window, real_frame.x, real_frame.y)
+        if restore_ax_animation then restore_ax_animation() end
         nativeCall("endUpdates")
         return nil, resize_error or size_error or
             "Accessibility did not report the accepted size"
@@ -1455,8 +1654,12 @@ local function precommitNativeResize(window, id, real_frame, end_frame)
     local resized_frame = hs.geometry.rect(
         end_frame.x, end_frame.y,
         accepted_size.w, accepted_size.h)
-    local accepted_end = hs.geometry.rect(
-        end_frame.x, end_frame.y, accepted_size.w, accepted_size.h)
+    local width_pending, height_pending = unchangedResizeDimensions(
+        real_frame, accepted_size, end_frame)
+    local size_pending = width_pending or height_pending
+    local accepted_end = hs.geometry.rect(end_frame.x, end_frame.y,
+        width_pending and end_frame.w or accepted_size.w,
+        height_pending and end_frame.h or accepted_size.h)
     local start_sx = real_frame.w / resized_frame.w
     local start_sy = real_frame.h / resized_frame.h
     local concealed, transform_error = nativeSet({ {
@@ -1468,6 +1671,7 @@ local function precommitNativeResize(window, id, real_frame, end_frame)
         tx = real_frame.x - (resized_frame.x * start_sx),
         ty = real_frame.y - (resized_frame.y * start_sy),
     } })
+    if restore_ax_animation then restore_ax_animation() end
     nativeCall("endUpdates")
 
     if not concealed then
@@ -1482,12 +1686,13 @@ local function precommitNativeResize(window, id, real_frame, end_frame)
         }, transform_error
     end
 
-    local status = sizesMatch(accepted_size, end_frame) and
-        "precommitted" or "precommitted-clamped"
+    local status = size_pending and "precommitted-pending" or
+        (sizesMatch(accepted_size, end_frame) and
+            "precommitted" or "precommitted-clamped")
     traceNativeAnimation(
-        "resize handoff window=%d status=%s accepted=%.0fx%.0f target=%.0fx%.0f",
+        "resize handoff window=%d status=%s accepted=%.0fx%.0f target=%.0fx%.0f enhanced_ui_suppressed=%s",
         id, status, accepted_size.w, accepted_size.h,
-        end_frame.w, end_frame.h)
+        end_frame.w, end_frame.h, tostring(restore_ax_animation ~= nil))
     return {
         real_frame = resized_frame,
         end_frame = accepted_end,
@@ -1509,21 +1714,28 @@ local function animateNativeFrame(window, real_frame, end_frame, watcher, genera
         updateNativeAnimationState(previous, Timer.secondsSinceEpoch())
     end
     local quarantined = quarantined_windows[id]
+    local parked = parked_presentations[id]
+    local parked_visual = parked_visual_presentations[id] or parked
     local start_x = previous and previous.x or
-        (quarantined and quarantined.end_frame.x or real_frame.x)
+        (parked_visual and parked_visual.x or
+            (quarantined and quarantined.end_frame.x or real_frame.x))
     local start_y = previous and previous.y or
-        (quarantined and quarantined.end_frame.y or real_frame.y)
+        (parked_visual and parked_visual.y or
+            (quarantined and quarantined.end_frame.y or real_frame.y))
     local start_sx = previous and previous.sx or
-        (quarantined and quarantined.end_frame.w / real_frame.w or 1)
+        (parked_visual and parked_visual.w / real_frame.w or
+            (quarantined and quarantined.end_frame.w / real_frame.w or 1))
     local start_sy = previous and previous.sy or
-        (quarantined and quarantined.end_frame.h / real_frame.h or 1)
+        (parked_visual and parked_visual.h / real_frame.h or
+            (quarantined and quarantined.end_frame.h / real_frame.h or 1))
     quarantined_windows[id] = nil
+
 
     -- An inverse-transform resize is safe only before a fresh compositor
     -- animation. An interrupted or quarantined window already has presentation
     -- state that must be resolved by the existing final-handoff path.
     local precommitted, precommit_error = nil, nil
-    if not direct and not previous and not quarantined then
+    if not direct and not previous and not quarantined and not parked then
         precommitted, precommit_error = precommitNativeResize(
             window, id, real_frame, end_frame)
     end
@@ -1544,7 +1756,6 @@ local function animateNativeFrame(window, real_frame, end_frame, watcher, genera
             "resize handoff window=%d status=precommit-skipped reason=%s",
             id, tostring(precommit_error))
     end
-
     native_animations[id] = {
         id = id,
         window = window,
@@ -1553,7 +1764,9 @@ local function animateNativeFrame(window, real_frame, end_frame, watcher, genera
         watcher = watcher,
         generation = generation,
         direct = direct == true,
-        payload_auto_commit = direct == true or sizesMatch(real_frame, end_frame),
+        ax_sync = live_reflow_ax_dirty[id] == true,
+        payload_auto_commit = not live_reflow_ax_dirty[id] and
+            (direct == true or sizesMatch(real_frame, end_frame)),
         start_x = start_x,
         start_y = start_y,
         start_sx = start_sx,
@@ -1608,10 +1821,21 @@ end
 ---record delivery of the focus event that starts a keyboard layout transition
 ---@param window Window
 function Windows.noteKeyboardFocusEvent(window)
-    local navigation = pending_keyboard_navigation
+    local navigation = pending_keyboard_navigation or
+        (native_animation_profile and native_animation_profile.keyboard) or
+        last_keyboard_navigation
     if navigation and navigation.target == window:id() then
         navigation.focus_event_at = Timer.absoluteTime()
     end
+end
+
+---the shortcut already tiled from this destination before AX focus arrived
+function Windows.keyboardLayoutAlreadyStarted(window)
+    local navigation = pending_keyboard_navigation or
+        (native_animation_profile and native_animation_profile.keyboard) or
+        last_keyboard_navigation
+    return navigation and navigation.target == window:id() and
+        navigation.prelayout_started == true
 end
 
 ---record completion of the synchronous layout pass after a keyboard focus event
@@ -1624,7 +1848,8 @@ function Windows.noteKeyboardLayoutComplete(window)
     end
     if not navigation or navigation.target ~= id then return end
 
-    navigation.layout_complete_at = Timer.absoluteTime()
+    navigation.layout_complete_at = navigation.layout_complete_at or
+        Timer.absoluteTime()
     if not native_animation_profile then
         pending_keyboard_navigation = nil
         local backend = next(position_animations) and "accessibility" or "none"
@@ -1769,6 +1994,22 @@ local function clearQuarantinedWindows()
     end
 end
 
+local function clearParkedPresentations()
+    local records, projected = {}, {}
+    for id, frame in pairs(parked_presentations) do
+        local visual = parked_visual_presentations[id]
+        if visual and not framesMatch(visual, frame) then
+            projected[#projected + 1] = { id = id }
+        else
+            records[#records + 1] = { id = id, end_frame = frame }
+        end
+        parked_presentations[id] = nil
+        parked_visual_presentations[id] = nil
+    end
+    if #records > 0 then commitNativePositions(records) end
+    if #projected > 0 then nativeSet(identityTransforms(projected)) end
+end
+
 _G.PaperWMNativeAnimationCleanup = function()
     focus_guard_generation = focus_guard_generation + 1
     focus_guard_target = nil
@@ -1779,6 +2020,7 @@ _G.PaperWMNativeAnimationCleanup = function()
     stopAllNativeAnimations(true)
     finishInteractiveMove(true)
     clearQuarantinedWindows()
+    clearParkedPresentations()
 end
 
 ---@enum Direction
@@ -1848,8 +2090,105 @@ function Windows.getWindowFrame(window)
         (interactive_moves and interactive_moves[id]) or quarantined_windows[id]
     local native_bounds_enabled = nativeBoundsBackendEnabled()
     local frame = animation and animation.end_frame or
+        parked_presentations[id] or
+        (live_reflow and live_reflow.frames[id]) or
         (native_bounds_enabled and nativeBounds(id)) or window:frame()
     return hs.geometry.rect(frame.x, frame.y, frame.w, frame.h)
+end
+
+---pan the tiled strip without changing which window has keyboard focus
+---@param direction Direction LEFT or RIGHT
+function Windows.scrollStrip(direction)
+    if direction ~= Direction.LEFT and direction ~= Direction.RIGHT then return end
+    local focused_window = Window.focusedWindow()
+    local index = focused_window and
+        Windows.PaperWM.state.index_table[focused_window:id()]
+    if not index then return end
+    local screen = Screen(Spaces.spaceDisplay(index.space))
+    if not screen then return end
+    local screen_frame = screen:frame()
+    local positions = Windows.PaperWM.state.x_positions[index.space] or {}
+    local items = {}
+    local content_left, content_right = math.huge, -math.huge
+    for _, column in ipairs(Windows.PaperWM.state.window_list[index.space] or {}) do
+        for _, window in ipairs(column) do
+            local frame = Windows.getWindowFrame(window)
+            local x = positions[window:id()] or frame.x
+            table.insert(items, { window = window, frame = frame, x = x })
+            content_left = math.min(content_left, x)
+            content_right = math.max(content_right, x + frame.w)
+        end
+    end
+    local left = screen_frame.x + Windows.PaperWM.screen_margin
+    local right = screen_frame.x2 - Windows.PaperWM.screen_margin
+    if content_right - content_left <= right - left then return end
+
+    local step = math.max(1,
+        (tonumber(Windows.PaperWM.keyboard_scroll_step) or 0.25) * screen_frame.w)
+    local delta = -direction * step
+    if delta > 0 then
+        delta = math.max(0, math.min(delta, left - content_left))
+    else
+        delta = math.min(0, math.max(delta, right - content_right))
+    end
+    if delta == 0 then return end
+
+    for _, item in ipairs(items) do
+        local x = item.x + delta
+        positions[item.window:id()] = x
+        item.frame.x = math.max(left - item.frame.w, math.min(x, right))
+        Windows.moveWindow(item.window, item.frame)
+    end
+    Windows.PaperWM.state.x_positions[index.space] = positions
+end
+
+---read WindowServer bounds without waiting for an Accessibility move event
+---@param id number
+---@return Frame|nil
+function Windows.nativeWindowBounds(id)
+    if not nativeBoundsBackendEnabled() then return nil end
+    return nativeBounds(id)
+end
+
+---identify a managed window under a physical mouse drag without an AX query
+---@param point table global screen coordinates
+---@return Window|nil, Space|nil, Frame|nil
+function Windows.managedWindowAtPoint(point)
+    if not point then return nil end
+    for _, screen in ipairs(Screen.allScreens()) do
+        local screen_frame = screen:frame()
+        if point.x >= screen_frame.x and point.x < screen_frame.x + screen_frame.w and
+            point.y >= screen_frame.y and point.y < screen_frame.y + screen_frame.h then
+            local space = Spaces.activeSpaceOnScreen(screen)
+            local items = {}
+            for _, column in ipairs(Windows.PaperWM.state.window_list[space] or {}) do
+                for _, window in ipairs(column) do
+                    table.insert(items, { window = window })
+                end
+            end
+            local frames = nativeBoundsBatch(items)
+            local hits = {}
+            for _, item in ipairs(items) do
+                local frame = frames[item.window:id()]
+                if frame and
+                    point.x >= frame.x and point.x < frame.x + frame.w and
+                    point.y >= frame.y and point.y < frame.y + frame.h then
+                    table.insert(hits, { window = item.window, frame = frame })
+                end
+            end
+            if #hits == 1 then return hits[1].window, space, hits[1].frame end
+            if #hits > 1 then
+                local focused = Window.focusedWindow()
+                for _, hit in ipairs(hits) do
+                    if focused and hit.window:id() == focused:id() then
+                        return hit.window, space, hit.frame
+                    end
+                end
+            end
+            return nil
+        end
+    end
+    return nil
 end
 
 ---report whether the experimental native animation helper can be used
@@ -1869,6 +2208,19 @@ function Windows.nativeInteractiveStatus()
     if selection.transform and nativeMoveBackendEnabled() then return true, nil end
     return false, native_transform_error or native_move_error or
         native_helper_error or selection.reason
+end
+
+---move a foreign window to another user Space through the Dock payload
+---@param window_id number
+---@param space_id number
+---@return boolean, string|nil
+function Windows.nativeMoveWindowToSpace(window_id, space_id)
+    return nativeHelperCall("windowToSpace", window_id, space_id)
+end
+
+---place a window directly without an Accessibility position animation
+function Windows.nativeMoveWindowPosition(window_id, x, y)
+    return nativeHelperCall("move", { { id = window_id, x = x, y = y } })
 end
 
 ---report the cached native write-capability decision
@@ -2210,10 +2562,21 @@ function Windows.getWindow(space, col, row)
     return (Windows.getColumn(space, col) or {})[row]
 end
 
----get the gap value for the specified side
+---resolve a monitor override, falling back to the configured global default
+function Windows.gapsEnabled(screen)
+    screen = screen or (Screen.mainScreen and Screen.mainScreen())
+    local uuid = screen and screen:getUUID()
+    local enabled = uuid and (Windows.PaperWM.gaps_by_screen or {})[uuid]
+    if type(enabled) == "boolean" then return enabled end
+    return Windows.PaperWM.gaps_enabled ~= false
+end
+
+---get the gap value for the specified side and monitor
 ---@param side string "top", "bottom", "left", or "right"
+---@param screen Screen|nil
 ---@return number gap size in pixels
-function Windows.getGap(side)
+function Windows.getGap(side, screen)
+    if not Windows.gapsEnabled(screen) then return 0 end
     local gap = Windows.PaperWM.window_gap
     if type(gap) == "number" then
         return gap            -- backward compatibility with single number
@@ -2229,10 +2592,10 @@ end
 ---@return Frame
 function Windows.getCanvas(screen)
     local screen_frame = screen:frame()
-    local left_gap = Windows.getGap("left")
-    local right_gap = Windows.getGap("right")
-    local top_gap = Windows.getGap("top")
-    local bottom_gap = Windows.getGap("bottom")
+    local left_gap = Windows.getGap("left", screen)
+    local right_gap = Windows.getGap("right", screen)
+    local top_gap = Windows.getGap("top", screen)
+    local bottom_gap = Windows.getGap("bottom", screen)
 
     return hs.geometry.rect(
         screen_frame.x + left_gap,
@@ -2284,13 +2647,13 @@ end
 ---@param w number|nil set windows to specified width
 ---@param id number|nil id of window to set specific height
 ---@param h4id number|nil specific height for provided window id
+---@param skip_window_id number|nil window whose pointer-controlled frame must not be written
 ---@return number width of tiled column
-function Windows.tileColumn(windows, bounds, h, w, id, h4id)
-    local last_window, frame
-    local bottom_gap = Windows.getGap("bottom")
+function Windows.tileColumn(windows, bounds, h, w, id, h4id, skip_window_id)
+    local bottom_gap = Windows.getGap("bottom", bounds.screen)
 
-    for _, window in ipairs(windows) do
-        frame = Windows.getWindowFrame(window)
+    for row, window in ipairs(windows) do
+        local frame = Windows.getWindowFrame(window)
         w = w or frame.w -- take given width or width of first window
         if bounds.x then -- set either left or right x coord
             frame.x = bounds.x
@@ -2306,16 +2669,18 @@ function Windows.tileColumn(windows, bounds, h, w, id, h4id)
         end
         frame.y = bounds.y
         frame.w = w
+        if bounds.min_x2 and bounds.max_x then
+            frame.x = math.max(bounds.min_x2 - w,
+                math.min(frame.x, bounds.max_x))
+        end
         frame.y2 = math.min(frame.y2, bounds.y2) -- don't overflow bottom of bounds
-        Windows.moveWindow(window, frame)
+        -- Compute the last row's final height before issuing its one resize.
+        -- A second move here used to precommit two different backing sizes.
+        if row == #windows then frame.y2 = bounds.y2 end
+        if window:id() ~= skip_window_id then
+            Windows.moveWindow(window, frame)
+        end
         bounds.y = math.min(frame.y2 + bottom_gap, bounds.y2)
-        last_window = window
-    end
-
-    -- expand last window height to bottom
-    if frame.y2 ~= bounds.y2 then
-        frame.y2 = bounds.y2
-        Windows.moveWindow(last_window, frame)
     end
     return w -- return width of column
 end
@@ -2360,16 +2725,65 @@ function Windows.refreshWindows(all_windows)
             -- add window
             local space = Windows.addWindow(window)
             if space then retile_spaces[space] = true end
-        elseif index.space ~= Spaces.windowSpaces(window)[1] then
-            -- move to window list in new space, don't focus nearby window
-            Windows.removeWindow(window, true)
-            local space = Windows.addWindow(window)
-            if space then retile_spaces[space] = true end
+        else
+            local space, previous_space = Windows.reconcileWindowSpace(window)
+            if previous_space then
+                retile_spaces[previous_space] = true
+                retile_spaces[space] = true
+            end
         end
     end
 
     -- retile spaces
     for space, _ in pairs(retile_spaces) do Windows.PaperWM:tileSpace(space) end
+end
+
+---reconcile a tracked window's actual Space without replacing its AX watcher
+---@return Space|nil current Space
+---@return Space|nil previous Space, only when transferred
+function Windows.reconcileWindowSpace(window)
+    local state = Windows.PaperWM.state
+    local id = window:id()
+    local index = state.index_table[id]
+    if not index then return nil end
+    local spaces = Spaces.windowSpaces(window) or {}
+    -- Transient/unassigned and all-Spaces windows are not a drag transfer.
+    if #spaces ~= 1 or Spaces.spaceType(spaces[1]) ~= "user" then
+        return nil
+    end
+    local destination = spaces[1]
+    if destination == index.space then return destination end
+    -- Resolve placement before mutating either list: a stale AX object must
+    -- not leave a half-transferred window behind if a bounds read fails.
+    local destination_columns = state.window_list[destination] or {}
+    local frame = nativeBounds(id) or Windows.getWindowFrame(window)
+    local center = frame.x + frame.w / 2
+    local insertion = #destination_columns + 1
+    local positions = state.x_positions[destination] or {}
+    for col, column in ipairs(destination_columns) do
+        local other = Windows.getWindowFrame(column[1])
+        local x = positions[column[1]:id()] or other.x
+        if center < x + other.w / 2 then insertion = col; break end
+    end
+    local previous = index.space
+    local columns = state.window_list[previous]
+    table.remove(columns[index.col], index.row)
+    if #columns[index.col] == 0 then table.remove(columns, index.col) end
+    Windows.updateIndexTable(previous, index.col)
+    local previous_positions = state.x_positions[previous]
+    if previous_positions then previous_positions[id] = nil end
+    if #columns == 0 then
+        state.window_list[previous] = nil
+        state.x_positions[previous] = nil
+    end
+
+    columns = destination_columns
+    state.window_list[destination] = columns
+    table.insert(columns, insertion, { window })
+    Windows.updateIndexTable(destination, insertion)
+    positions[id] = frame.x
+    state.x_positions[destination] = positions
+    return destination, previous
 end
 
 ---add a new window to be tracked and automatically tiled
@@ -2466,6 +2880,11 @@ function Windows.removeWindow(remove_window, skip_new_window_focus)
         Windows.PaperWM.logger.df("ignoring removal of untracked window %d", remove_window:id())
         return
     end
+    if parked_presentations[remove_window:id()] then
+        nativeSet(identityTransforms({ { id = remove_window:id() } }))
+        parked_presentations[remove_window:id()] = nil
+        parked_visual_presentations[remove_window:id()] = nil
+    end
 
     if not skip_new_window_focus then -- find nearby window to focus
         for _, direction in ipairs({
@@ -2495,6 +2914,7 @@ function Windows.removeWindow(remove_window, skip_new_window_focus)
 
     -- update index table
     Windows.PaperWM.state.index_table[remove_window:id()] = nil
+    live_reflow_ax_dirty[remove_window:id()] = nil
     Windows.updateIndexTable(remove_index.space, remove_index.col)
 
     -- remove if space is empty
@@ -2507,6 +2927,11 @@ function Windows.removeWindow(remove_window, skip_new_window_focus)
 end
 
 function Windows.removeWindowIndex(remove_index, remove_id)
+    if parked_presentations[remove_id] then
+        nativeSet(identityTransforms({ { id = remove_id } }))
+        parked_presentations[remove_id] = nil
+        parked_visual_presentations[remove_id] = nil
+    end
     -- remove window
     table.remove(Windows.PaperWM.state.window_list[remove_index.space][remove_index.col],
         remove_index.row)
@@ -2525,6 +2950,7 @@ function Windows.removeWindowIndex(remove_index, remove_id)
 
     -- update index table
     Windows.PaperWM.state.index_table[remove_id] = nil
+    live_reflow_ax_dirty[remove_id] = nil
     Windows.updateIndexTable(remove_index.space, remove_index.col)
 
     -- remove if space is empty
@@ -2549,6 +2975,7 @@ local function beginFocusGuard(window)
             local target = focus_guard_target
             focus_guard_target = nil
             focus_guard_timer = nil
+            last_keyboard_navigation = nil
             if target and Window.focusedWindow() ~= target then
                 pcall(target.focus, target)
             end
@@ -2629,12 +3056,38 @@ function Windows.focusWindow(direction, focused_index)
         requested_at = navigation_started,
         target = new_focused_window:id(),
         space = focused_index.space,
+        prelayout_started = true,
     }
     pending_keyboard_navigation = navigation
+    last_keyboard_navigation = navigation
     local focus_started = Timer.absoluteTime()
     beginFocusGuard(new_focused_window)
     navigation.focus_call_ms =
         (Timer.absoluteTime() - focus_started) / 1000000
+
+    -- The destination is known from the shortcut. Start the compositor move
+    -- now instead of waiting for the application's AX focus notification.
+    if focus_guard_target == new_focused_window then
+        navigation.layout_started_at = Timer.absoluteTime()
+        local events = Windows.PaperWM.events
+        local tiled
+        if events and events.retileSpace then
+            tiled = events.retileSpace(
+                focused_index.space, nil, new_focused_window)
+        else
+            Windows.PaperWM.space.tileSpace(
+                focused_index.space, nil, nil, new_focused_window)
+            tiled = true
+        end
+        if tiled then
+            Windows.noteKeyboardLayoutComplete(new_focused_window)
+            -- The synchronous layout has queued every window. Submit its one
+            -- Dock transaction now instead of deferring it to a zero-delay timer.
+            Windows.flushNativeAnimationBatch()
+        else
+            navigation.prelayout_started = false
+        end
+    end
 
     return new_focused_window
 end
@@ -2722,8 +3175,7 @@ function Windows.swapWindows(direction)
         -- swap frames
         local focused_frame = Windows.getWindowFrame(focused_window)
         local target_frame = Windows.getWindowFrame(target_column[1])
-        local right_gap = Windows.getGap("right")
-        local left_gap = Windows.getGap("left")
+        local right_gap = Windows.getGap("right", focused_window:screen())
         if direction == Direction.LEFT then
             focused_frame.x = target_frame.x
             target_frame.x = focused_frame.x2 + right_gap
@@ -2768,7 +3220,7 @@ function Windows.swapWindows(direction)
         -- swap frames
         local focused_frame = Windows.getWindowFrame(focused_window)
         local target_frame = Windows.getWindowFrame(target_window)
-        local bottom_gap = Windows.getGap("bottom")
+        local bottom_gap = Windows.getGap("bottom", focused_window:screen())
         if direction == Direction.UP then
             focused_frame.y = target_frame.y
             target_frame.y = focused_frame.y2 + bottom_gap
@@ -2935,10 +3387,12 @@ function Windows.cycleWindowSize(direction, cycle_direction)
         local gap
         if dimension == Direction.WIDTH then
             -- For width, use the average of left and right gaps
-            gap = (Windows.getGap("left") + Windows.getGap("right")) / 2
+            gap = (Windows.getGap("left", focused_window:screen()) +
+                Windows.getGap("right", focused_window:screen())) / 2
         else
             -- For height, use the average of top and bottom gaps
-            gap = (Windows.getGap("top") + Windows.getGap("bottom")) / 2
+            gap = (Windows.getGap("top", focused_window:screen()) +
+                Windows.getGap("bottom", focused_window:screen())) / 2
         end
 
         local sizes = {}
@@ -3091,9 +3545,11 @@ function Windows.slurpWindow()
     Windows.updateIndexTable(focused_index.space, focused_index.col)
 
     -- adjust window frames
-    local canvas = Windows.getCanvas(focused_window:screen())
-    local bottom_gap = Windows.getGap("bottom")
+    local screen = focused_window:screen()
+    local canvas = Windows.getCanvas(screen)
+    local bottom_gap = Windows.getGap("bottom", screen)
     local bounds = {
+        screen = screen,
         x = Windows.getWindowFrame(column[1]).x,
         x2 = nil,
         y = canvas.y,
@@ -3145,12 +3601,14 @@ function Windows.barfWindow()
 
     -- adjust window frames
     local num_windows = #column
-    local canvas = Windows.getCanvas(focused_window:screen())
+    local screen = focused_window:screen()
+    local canvas = Windows.getCanvas(screen)
     local focused_frame = Windows.getWindowFrame(focused_window)
-    local bottom_gap = Windows.getGap("bottom")
-    local right_gap = Windows.getGap("right")
+    local bottom_gap = Windows.getGap("bottom", screen)
+    local right_gap = Windows.getGap("right", screen)
 
-    local bounds = { x = focused_frame.x, x2 = nil, y = canvas.y, y2 = canvas.y2 }
+    local bounds = { screen = screen, x = focused_frame.x, x2 = nil,
+        y = canvas.y, y2 = canvas.y2 }
     local h = math.max(0, canvas.h - ((num_windows - 1) * bottom_gap)) //
         num_windows
     focused_frame.y = canvas.y
@@ -3175,7 +3633,40 @@ function Windows.moveWindow(window, frame)
         return
     end
 
-    if frame == Windows.getWindowFrame(window) then
+    if live_reflow then
+        -- A live drag only needs the neighbors' positions to track the
+        -- pointer. Queue their final positions for one Dock/WindowServer move
+        -- instead of issuing several synchronous AX setFrame calls per tick.
+        -- Any size changes are settled by the ordinary layout on mouse-up.
+        if not live_reflow.targets[id] then
+            table.insert(live_reflow.order, id)
+        end
+        if not live_reflow_watchers[id] then
+            watcher:stop()
+            move_generations[id] = (move_generations[id] or 0) + 1
+            live_reflow_watchers[id] = {
+                space = live_reflow.space, watcher = watcher,
+                generation = move_generations[id],
+            }
+        end
+        live_reflow.targets[id] = {
+            window = window,
+            frame = hs.geometry.rect(frame.x, frame.y, frame.w, frame.h),
+        }
+        return
+    end
+
+    local managed_index = Windows.PaperWM.state.index_table[id]
+    local events = Windows.PaperWM.events
+    if managed_index and events and events.draggedWindowID and
+        events.draggedWindowID(managed_index.space) then
+        -- Poll-driven reflow owns this Space until mouse-up. A focus/AX
+        -- notification must not start a second animation over its positions.
+        return
+    end
+
+    local force_ax_sync = live_reflow_ax_dirty[id] == true
+    if not force_ax_sync and frame == Windows.getWindowFrame(window) then
         Windows.PaperWM.logger.v("no change in window frame")
         return
     end
@@ -3195,7 +3686,12 @@ function Windows.moveWindow(window, frame)
         stopPositionAnimation(id)
         animateNativeFrame(window, current_frame, frame, watcher, generation)
     elseif current_frame.w == frame.w and current_frame.h == frame.h and
-        Window.animationDuration > 0 then
+        Window.animationDuration > 0 and not force_ax_sync then
+        if parked_presentations[id] then
+            parked_presentations[id] = nil
+            parked_visual_presentations[id] = nil
+            nativeSet(identityTransforms({ { id = id } }))
+        end
         stopNativeAnimation(id, true)
         current_frame = window:frame()
         local app = window:application()
@@ -3205,6 +3701,11 @@ function Windows.moveWindow(window, frame)
         end
         animatePosition(window, current_frame, frame, watcher, generation)
     else
+        if parked_presentations[id] then
+            parked_presentations[id] = nil
+            parked_visual_presentations[id] = nil
+            nativeSet(identityTransforms({ { id = id } }))
+        end
         stopNativeAnimation(id, true)
         stopPositionAnimation(id)
         local app = window:application()
@@ -3212,18 +3713,172 @@ function Windows.moveWindow(window, frame)
         if ax_app and ax_app.AXEnhancedUserInterface then
             ax_app.AXEnhancedUserInterface = false
         end
-        window:setFrame(frame)
+        if force_ax_sync then
+            window:setFrame(frame, 0)
+            live_reflow_ax_dirty[id] = nil
+        else
+            window:setFrame(frame)
+        end
         restartWatcherAfter(Window.animationDuration + watcher_restart_padding,
             id, watcher, generation)
     end
 end
 
+---collect position-only moves during one pointer-driven layout pass
+---@param space Space|nil managed Space whose bounds can be read together
+function Windows.beginLiveReflow(space)
+    if live_reflow then return false end
+    local frames, bounds_ms = {}, 0
+    if space then
+        local items = {}
+        local adopting = {}
+        for _, column in ipairs(Windows.PaperWM.state.window_list[space] or {}) do
+            for _, window in ipairs(column) do
+                table.insert(items, { window = window })
+                local animation = native_animations[window:id()]
+                if animation then adopting[#adopting + 1] = animation end
+                stopPositionAnimation(window:id())
+            end
+        end
+        if #adopting > 0 then
+            updateAllNativeAnimationStates()
+            local cancelled, reason = cancelNativePayloadAnimation()
+            if not cancelled then
+                traceNativeAnimation("drag adoption failed: %s", tostring(reason))
+                return false
+            end
+            stopNativeLifecycleTimers()
+            local transforms = {}
+            local events = Windows.PaperWM.events
+            local dragged_id = events and events.draggedWindowID and
+                events.draggedWindowID(space)
+            for _, animation in ipairs(adopting) do
+                local id = animation.id
+                native_animations[id] = nil
+                animation.watcher:stop()
+                move_generations[id] = (move_generations[id] or 0) + 1
+                live_reflow_watchers[id] = {
+                    space = space, watcher = animation.watcher,
+                    generation = move_generations[id],
+                }
+                if id == dragged_id then
+                    transforms[#transforms + 1] = identityTransforms({ animation })[1]
+                    parked_presentations[id] = nil
+                    parked_visual_presentations[id] = nil
+                else
+                    local visual = hs.geometry.rect(animation.x, animation.y,
+                        animation.real_frame.w * animation.sx,
+                        animation.real_frame.h * animation.sy)
+                    parked_presentations[id] = animation.end_frame
+                    parked_visual_presentations[id] = visual
+                    transforms[#transforms + 1] = targetTransform(
+                        { id = id, end_frame = visual }, animation.real_frame)
+                end
+            end
+            nativeSetAtomic(transforms)
+            if next(native_animations) then
+                if nativeDisplayLinkEnabled() then scheduleNativeAnimationTransaction() end
+            else
+                if native_animation_timer then
+                    native_animation_timer:stop()
+                    native_animation_timer = nil
+                end
+                finishNativeAnimationProfile("drag-adopted")
+            end
+        end
+        if #items > 0 then
+            local started = Timer.absoluteTime()
+            frames = nativeBoundsBatch(items)
+            bounds_ms = (Timer.absoluteTime() - started) / 1000000
+        end
+    end
+    live_reflow = {
+        space = space, order = {}, targets = {}, frames = frames,
+        bounds_ms = bounds_ms,
+    }
+    return true
+end
+
+---release watcher ownership after the drag's final layout has settled
+function Windows.liveReflowOwnsWindow(id)
+    return live_reflow_watchers[id] ~= nil
+end
+
+function Windows.finishLiveReflow(space)
+    for id, record in pairs(live_reflow_watchers) do
+        if not space or record.space == space then
+            live_reflow_watchers[id] = nil
+            restartWatcherAfter(watcher_restart_padding, id,
+                record.watcher, record.generation)
+        end
+    end
+end
+
+---apply one native position batch, retaining the AX path if it is unavailable
+---@param apply boolean discard a partially computed layout when false
+---@return boolean native batch succeeded
+---@return number window count
+---@return string|nil error
+---@return table|nil profile
+function Windows.endLiveReflow(apply)
+    local batch = live_reflow
+    live_reflow = nil
+    if not batch or not apply then return false, 0, "layout aborted" end
+
+    local moves, unpark = {}, {}
+    for _, id in ipairs(batch.order) do
+        local target = batch.targets[id]
+        if parked_presentations[id] then
+            unpark[#unpark + 1] = {
+                id = id, end_frame = target.frame,
+            }
+        else
+            moves[#moves + 1] = {
+                id = id, x = target.frame.x, y = target.frame.y,
+            }
+        end
+    end
+    local profile = { bounds_ms = batch.bounds_ms, move_ms = 0 }
+    if #moves == 0 and #unpark == 0 then
+        return true, 0, nil, profile
+    end
+
+    local move_started = Timer.absoluteTime()
+    local moved, reason = true, nil
+    if #moves > 0 then moved, reason = nativeHelperCall("move", moves) end
+    if moved and #unpark > 0 then
+        moved, reason = commitNativePositions(unpark)
+        if moved then
+            for _, item in ipairs(unpark) do
+                parked_presentations[item.id] = nil
+                parked_visual_presentations[item.id] = nil
+            end
+        end
+    end
+    profile.move_ms = (Timer.absoluteTime() - move_started) / 1000000
+    if moved then
+        for _, move in ipairs(moves) do live_reflow_ax_dirty[move.id] = true end
+        for _, item in ipairs(unpark) do live_reflow_ax_dirty[item.id] = true end
+        return true, #batch.order, nil, profile
+    end
+
+    for _, move in ipairs(moves) do
+        local target = batch.targets[move.id]
+        Windows.moveWindow(target.window, target.frame)
+    end
+    return false, #batch.order, reason, profile
+end
+
 ---finish active presentation transforms and restore real window frames
 function Windows.stopAnimations(clear_quarantine)
+    Windows.finishLiveReflow()
     finishInteractiveMove(true)
     stopAllNativeAnimations(true)
     stopAllPositionAnimations(true)
-    if clear_quarantine then clearQuarantinedWindows() end
+    if clear_quarantine then
+        clearQuarantinedWindows()
+        clearParkedPresentations()
+    end
 end
 
 ---add or remove focused window from the floating layer and retile the space

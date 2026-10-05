@@ -31,11 +31,8 @@
 --- be tiled off-screen are placed in a margin on the left and right edge of the
 --- screen. They are still visible and clickable.
 ---
---- It's difficult to detect when a window is dragged from one space or screen to
---- another. Use the move_window_N commands to move windows between spaces and
---- screens.
----
---- Arrange screens vertically to prevent windows from bleeding into other screens.
+--- Dragging between Spaces/screens reconciles the virtual layout on release.
+--- The move_window_N commands also move windows between Spaces and screens.
 ---
 ---
 --- Download: [https://github.com/mogenson/PaperWM.spoon](https://github.com/mogenson/PaperWM.spoon)
@@ -98,6 +95,11 @@ function PaperWM:start()
     -- stall Hammerspoon's main thread.
     Window.timeout(self.ax_timeout)
 
+    self.gaps_by_screen = self.gaps_by_screen or {}
+    for uuid, enabled in pairs(hs.settings.get(self.state.GapsByScreenKey) or {}) do
+        if type(enabled) == "boolean" then self.gaps_by_screen[uuid] = enabled end
+    end
+
     -- clear state
     self.state.window_list = {}
     self.state.index_table = {}
@@ -156,6 +158,26 @@ end
 
 function PaperWM:tileSpace(space)
     self.space.tileSpace(space)
+end
+
+---toggle and persist gaps on the focused window's monitor (or pointer monitor)
+---@param screen Screen|nil monitor to toggle explicitly
+---@return boolean gaps_enabled
+function PaperWM:toggleGaps(screen)
+    local focused = Window.focusedWindow()
+    screen = screen or (focused and focused:screen()) or hs.mouse.getCurrentScreen()
+    if not screen then return end
+    local canvas = self.windows.getCanvas(screen)
+    local enabled = not self.windows.gapsEnabled(screen)
+    self.gaps_by_screen = self.gaps_by_screen or {}
+    self.gaps_by_screen[screen:getUUID()] = enabled
+    hs.settings.set(self.state.GapsByScreenKey, self.gaps_by_screen)
+    local space = Spaces.activeSpaceOnScreen(screen)
+    if space and Spaces.spaceType(space) == "user" then
+        self.events.retileSpace(space, canvas)
+        self.windows.flushNativeAnimationBatch()
+    end
+    return enabled
 end
 
 function PaperWM:bindHotkeys(mapping)

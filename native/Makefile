@@ -1,8 +1,8 @@
 HAMMERSPOON_APP ?= /Applications/Hammerspoon.app
 LUA_HEADERS := $(HAMMERSPOON_APP)/Contents/Frameworks/LuaSkin.framework/Headers
 TARGET := paperwm_transform.so
-SOURCES := paperwm_transform.m injector/client.c
-HEADERS := injector/client.h injector/protocol.h
+SOURCES := paperwm_transform.m injector/client.c injector/ax_client.c
+HEADERS := injector/client.h injector/protocol.h injector/ax_client.h injector/ax_protocol.h
 
 .PHONY: all clean injector injector-check
 

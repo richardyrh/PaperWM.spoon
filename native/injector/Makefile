@@ -34,10 +34,11 @@ $(PAYLOAD): payload.m protocol.h
 		-dynamiclib -fPIC -framework ApplicationServices -framework CoreVideo \
 		-o "$@" payload.m
 
-$(MONITOR): monitor.m client.c client.h protocol.h
+$(MONITOR): monitor.m ax_service.m ax_service.h ax_protocol.h client.c client.h protocol.h
 	mkdir -p "$(dir $@)"
 	xcrun clang $(COMMON_FLAGS) -fobjc-arc $(MONITOR_ARCH) \
-		-framework AppKit -o "$@" monitor.m client.c
+		-framework AppKit -framework ApplicationServices \
+		-o "$@" monitor.m ax_service.m client.c
 
 $(PROBE): probe.m client.c client.h protocol.h
 	mkdir -p "$(dir $@)"

@@ -15,6 +15,7 @@
 #include <lauxlib.h>
 
 #include "injector/client.h"
+#include "injector/ax_client.h"
 
 typedef int CGSConnectionID;
 typedef int CGSWindowID;
@@ -40,6 +41,7 @@ typedef CGError (*CGSSetWindowTransformsFn)(CGSConnectionID,
 typedef CGError (*CGSDisableUpdateFn)(CGSConnectionID);
 typedef CGError (*CGSReenableUpdateFn)(CGSConnectionID);
 typedef CGError (*CGSMoveWindowFn)(CGSConnectionID, CGSWindowID, const CGPoint *);
+extern AXError _AXUIElementGetWindow(AXUIElementRef, CGWindowID *);
 
 static void *skyLight = NULL;
 static CGSMainConnectionIDFn mainConnectionID = NULL;
@@ -846,6 +848,35 @@ static int windowMove(lua_State *L) {
     return 2;
 }
 
+static int windowToSpace(lua_State *L) {
+    lua_Integer requested_window = luaL_checkinteger(L, 1);
+    lua_Integer requested_space = luaL_checkinteger(L, 2);
+    if (requested_window <= 0 || requested_window > UINT32_MAX ||
+        requested_space <= 0) {
+        return luaL_error(L, "invalid window or space ID");
+    }
+
+    if (!dockHasCapability(PAPERWM_INJECTOR_CAP_WINDOW_TO_SPACE, true)) {
+        lua_pushnil(L);
+        lua_pushstring(L, dockCapabilityError[0] ? dockCapabilityError :
+            "Dock payload cannot move windows between Spaces");
+        return 2;
+    }
+
+    char error[256] = {0};
+    bool moved = paperwm_injector_window_to_space(
+        getuid(), (uint32_t)requested_window, (uint64_t)requested_space,
+        NULL, error, sizeof(error));
+    if (!moved) {
+        invalidateDockCapabilities(error);
+        lua_pushnil(L);
+        lua_pushstring(L, error);
+        return 2;
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
 typedef bool (*PaperWMInteractiveRequestFn)(
     uid_t,
     const paperwm_injector_move_t *,
@@ -1486,6 +1517,208 @@ static bool sendDockTransforms(const CGSWindowID *windowIDs,
     return result;
 }
 
+// Keep the real AX resize and its concealing compositor transform in one
+// native operation. This is deliberately restricted to the Dock route: an AX
+// request must never run on Dock's display-link or socket threads.
+static int windowPrepareResize(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    if (!loadSkyLight() || !mainConnectionID || !disableUpdate ||
+        !reenableUpdate || transformRoute != NATIVE_ROUTE_DOCK ||
+        !dockHasCapability(PAPERWM_INJECTOR_CAP_TRANSFORM, false)) {
+        lua_pushnil(L);
+        lua_pushstring(L, "native AX resize handoff requires the Dock transform route");
+        return 2;
+    }
+    lua_getfield(L, 1, "id");
+    CGSWindowID windowID = (CGSWindowID)luaL_checkinteger(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "pid");
+    pid_t pid = (pid_t)luaL_checkinteger(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "timeout");
+    double timeout = luaL_optnumber(L, -1, 0.2);
+    lua_pop(L, 1);
+    const char *names[] = {"start_x", "start_y", "start_w", "start_h",
+                           "end_x", "end_y", "end_w", "end_h"};
+    double values[8];
+    for (int i = 0; i < 8; ++i) {
+        lua_getfield(L, 1, names[i]);
+        values[i] = luaL_checknumber(L, -1);
+        lua_pop(L, 1);
+        if (!isfinite(values[i])) return luaL_error(L, "non-finite resize frame");
+    }
+    if (pid <= 0 || windowID == 0 || !isfinite(timeout) ||
+        timeout < 0.05 || timeout > 1.0 ||
+        values[2] <= 0 || values[3] <= 0 ||
+        values[6] <= 0 || values[7] <= 0) {
+        lua_pushnil(L);
+        lua_pushstring(L, "invalid native resize request");
+        return 2;
+    }
+    lua_getfield(L, 1, "service");
+    bool useService = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    if (useService) {
+        paperwm_ax_request_t request = {
+            .magic = PAPERWM_AX_MAGIC,
+            .version = PAPERWM_AX_VERSION,
+            .window_id = (uint32_t)windowID,
+            .pid = pid,
+            .timeout = timeout,
+            .start_x = values[0], .start_y = values[1],
+            .start_w = values[2], .start_h = values[3],
+            .end_x = values[4], .end_y = values[5],
+            .end_w = values[6], .end_h = values[7],
+        };
+        paperwm_ax_response_t response = {0};
+        char error[256] = {0};
+        if (!paperwm_ax_prepare(getuid(), &request, &response,
+                                error, sizeof(error))) {
+            lua_pushnil(L);
+            lua_pushstring(L, error);
+            return 2;
+        }
+        lua_createtable(L, 0, 4);
+        lua_pushnumber(L, response.accepted_w);
+        lua_setfield(L, -2, "accepted_w");
+        lua_pushnumber(L, response.accepted_h);
+        lua_setfield(L, -2, "accepted_h");
+        lua_pushboolean(L, response.concealed);
+        lua_setfield(L, -2, "concealed");
+        if (!response.concealed) {
+            lua_pushstring(L, response.error);
+            lua_setfield(L, -2, "transform_error");
+        }
+        return 1;
+    }
+    if (!AXIsProcessTrusted()) {
+        lua_pushnil(L);
+        lua_pushstring(L, "Accessibility permission is unavailable");
+        return 2;
+    }
+
+    AXUIElementRef application = AXUIElementCreateApplication(pid);
+    if (!application) {
+        lua_pushnil(L);
+        lua_pushstring(L, "could not create AX application element");
+        return 2;
+    }
+    AXUIElementSetMessagingTimeout(application, (float)timeout);
+    CFTypeRef windowsValue = NULL;
+    AXError axError = AXUIElementCopyAttributeValue(
+        application, kAXWindowsAttribute, &windowsValue);
+    AXUIElementRef target = NULL;
+    if (axError == kAXErrorSuccess && windowsValue &&
+        CFGetTypeID(windowsValue) == CFArrayGetTypeID()) {
+        CFArrayRef windows = (CFArrayRef)windowsValue;
+        for (CFIndex i = 0; i < CFArrayGetCount(windows); ++i) {
+            AXUIElementRef candidate = (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
+            CGWindowID candidateID = 0;
+            if (_AXUIElementGetWindow(candidate, &candidateID) == kAXErrorSuccess &&
+                candidateID == (CGWindowID)windowID) {
+                target = CFRetain(candidate);
+                break;
+            }
+        }
+    }
+    if (windowsValue) CFRelease(windowsValue);
+    if (!target) {
+        CFRelease(application);
+        lua_pushnil(L);
+        lua_pushfstring(L, "AX window %d not found (error %d)", windowID, axError);
+        return 2;
+    }
+    AXUIElementSetMessagingTimeout(target, (float)timeout);
+
+    CFTypeRef enhanced = NULL;
+    bool restoreEnhanced = AXUIElementCopyAttributeValue(
+        application, CFSTR("AXEnhancedUserInterface"), &enhanced) == kAXErrorSuccess &&
+        enhanced == kCFBooleanTrue;
+    if (restoreEnhanced) {
+        restoreEnhanced = AXUIElementSetAttributeValue(
+            application, CFSTR("AXEnhancedUserInterface"), kCFBooleanFalse) == kAXErrorSuccess;
+    }
+    if (enhanced) CFRelease(enhanced);
+
+    CGSConnectionID connection = mainConnectionID();
+    CGError updateError = disableUpdate(connection);
+    if (updateError != kCGErrorSuccess) {
+        if (restoreEnhanced) AXUIElementSetAttributeValue(
+            application, CFSTR("AXEnhancedUserInterface"), kCFBooleanTrue);
+        CFRelease(target);
+        CFRelease(application);
+        lua_pushnil(L);
+        lua_pushfstring(L, "could not suspend WindowServer updates: %d", updateError);
+        return 2;
+    }
+    CGPoint position = CGPointMake(values[4], values[5]);
+    CGSize size = CGSizeMake(values[6], values[7]);
+    AXValueRef positionValue = AXValueCreate(kAXValueCGPointType, &position);
+    AXValueRef sizeValue = AXValueCreate(kAXValueCGSizeType, &size);
+    AXError positionError = positionValue ? AXUIElementSetAttributeValue(
+        target, kAXPositionAttribute, positionValue) : kAXErrorFailure;
+    AXError sizeError = positionError == kAXErrorSuccess && sizeValue ?
+        AXUIElementSetAttributeValue(target, kAXSizeAttribute, sizeValue) :
+        kAXErrorFailure;
+    if (positionValue) CFRelease(positionValue);
+    if (sizeValue) CFRelease(sizeValue);
+
+    CFTypeRef acceptedValue = NULL;
+    AXError readError = sizeError == kAXErrorSuccess ?
+        AXUIElementCopyAttributeValue(target, kAXSizeAttribute, &acceptedValue) :
+        kAXErrorFailure;
+    CGSize accepted = CGSizeZero;
+    bool acceptedValid = readError == kAXErrorSuccess && acceptedValue &&
+        CFGetTypeID(acceptedValue) == AXValueGetTypeID() &&
+        AXValueGetType((AXValueRef)acceptedValue) == kAXValueCGSizeType &&
+        AXValueGetValue((AXValueRef)acceptedValue, kAXValueCGSizeType, &accepted) &&
+        accepted.width > 0 && accepted.height > 0;
+    if (acceptedValue) CFRelease(acceptedValue);
+
+    bool concealed = false;
+    char transformError[256] = {0};
+    if (positionError == kAXErrorSuccess && sizeError == kAXErrorSuccess &&
+        acceptedValid) {
+        CGAffineTransform transform = CGAffineTransformMake(
+            values[2] / accepted.width, 0, 0, values[3] / accepted.height,
+            values[0] - values[4] * values[2] / accepted.width,
+            values[1] - values[5] * values[3] / accepted.height);
+        CGPoint base = CGPointMake(values[4], values[5]);
+        concealed = sendDockTransforms(&windowID, &transform, &base, 1,
+                                       transformError, sizeof(transformError));
+    }
+    if (positionError == kAXErrorSuccess &&
+        (sizeError != kAXErrorSuccess || !acceptedValid)) {
+        CGPoint original = CGPointMake(values[0], values[1]);
+        AXValueRef originalValue = AXValueCreate(kAXValueCGPointType, &original);
+        if (originalValue) {
+            AXUIElementSetAttributeValue(target, kAXPositionAttribute, originalValue);
+            CFRelease(originalValue);
+        }
+    }
+    reenableUpdate(connection);
+    if (restoreEnhanced) AXUIElementSetAttributeValue(
+        application, CFSTR("AXEnhancedUserInterface"), kCFBooleanTrue);
+    CFRelease(target);
+    CFRelease(application);
+
+    if (positionError != kAXErrorSuccess || sizeError != kAXErrorSuccess ||
+        !acceptedValid) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "AX resize failed: position=%d size=%d read=%d",
+                        positionError, sizeError, readError);
+        return 2;
+    }
+    lua_createtable(L, 0, 8);
+    lua_pushnumber(L, accepted.width); lua_setfield(L, -2, "accepted_w");
+    lua_pushnumber(L, accepted.height); lua_setfield(L, -2, "accepted_h");
+    lua_pushboolean(L, concealed); lua_setfield(L, -2, "concealed");
+    if (!concealed) {
+        lua_pushstring(L, transformError); lua_setfield(L, -2, "transform_error");
+    }
+    return 1;
+}
+
 static int windowCommit(lua_State *L) {
     luaL_checktype(L, 1, LUA_TTABLE);
     luaL_checktype(L, 2, LUA_TTABLE);
@@ -1758,11 +1991,13 @@ static const luaL_Reg transformFunctions[] = {
     {"probe", transformProbe},
     {"bounds", windowBounds},
     {"move", windowMove},
+    {"windowToSpace", windowToSpace},
     {"animate", windowAnimate},
     {"interactiveBegin", windowInteractiveBegin},
     {"interactiveUpdate", windowInteractiveUpdate},
     {"interactiveEnd", windowInteractiveEnd},
     {"commit", windowCommit},
+    {"prepareResize", windowPrepareResize},
     {"set", transformSet},
     {"setAtomic", transformSetAtomic},
     {"setSingular", transformSetSingular},

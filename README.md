@@ -55,6 +55,10 @@ PaperWM:bindHotkeys({
     focus_up    = {{"alt", "cmd"}, "up"},
     focus_down  = {{"alt", "cmd"}, "down"},
 
+    -- pan the strip without changing the focused window
+    scroll_left  = {{"ctrl"}, "["},
+    scroll_right = {{"ctrl"}, "]"},
+
     -- switch windows by cycling forward/backward
     -- (forward = down or right, backward = up or left)
     focus_prev = {{"alt", "cmd"}, "k"},
@@ -75,6 +79,7 @@ PaperWM:bindHotkeys({
     -- position and resize focused window
     center_window        = {{"alt", "cmd"}, "c"},
     full_width           = {{"alt", "cmd"}, "f"},
+    toggle_gaps          = {{"ctrl", "shift"}, "f"},
     cycle_width          = {{"alt", "cmd"}, "r"},
     reverse_cycle_width  = {{"ctrl", "alt", "cmd"}, "r"},
     cycle_height         = {{"alt", "cmd", "shift"}, "r"},
@@ -166,6 +171,23 @@ PaperWM.window_gap = 10
 PaperWM.window_gap  =  { top = 10, bottom = 8, left = 12, right = 12 }
 ```
 
+For gaps only on the left, right, and bottom, use:
+
+```lua
+PaperWM.window_gap = { top = 0, bottom = 8, left = 8, right = 8 }
+PaperWM.gaps_enabled = true -- default for monitors without a saved override
+```
+
+Bind `toggle_gaps = {{"ctrl", "shift"}, "f"}` in your `PaperWM:bindHotkeys`
+mapping to toggle gaps at runtime. You can also call `PaperWM:toggleGaps()`.
+This toggles only the focused window's monitor (or the pointer's monitor if no
+window is focused). The enabled state is saved in `hs.settings`, keyed by the
+display UUID, so it survives reloads, restarts, and reconnecting the display.
+`PaperWM:toggleGaps(screen)` targets an explicit `hs.screen` object. `window_gap`
+is preserved; the target display's active Space is animated immediately and its
+other Spaces use the setting when next tiled. The top edge is relative to macOS's
+usable screen area below the menu bar.
+
 ### Experimental native animations
 
 PaperWM can animate window position and size changes, including interactive
@@ -194,6 +216,9 @@ The installer creates a narrowly scoped, digest-pinned sudoers command and a
 per-user LaunchAgent that reinjects after Dock restarts. See
 [`native/injector/README.md`](native/injector/README.md) for the installed
 files, security prerequisites, status command, and uninstall instructions.
+On macOS 27, the `move_window_N` actions use the Dock payload to move a
+window between Spaces; Mission Control no longer accepts the synthetic drag
+used on earlier macOS versions.
 
 ```lua
 PaperWM.animation_backend = "native" -- default for this experimental build
@@ -203,6 +228,17 @@ PaperWM.animation_curve = { 0.2, 0.0, 0.0, 1.0 }
 
 -- Bound synchronous AX calls when an application is hung (seconds).
 PaperWM.ax_timeout = 0.2
+
+-- Experimental: one native call handles the AX size write and concealing
+-- compositor transform. "service" runs AX in the injector LaunchAgent and
+-- requires Accessibility permission for paperwm-injector.
+PaperWM.resize_handoff_backend = "lua" -- "native" or "service"
+
+-- Each Ctrl+[ or Ctrl+] press pans by this fraction of the screen width.
+PaperWM.keyboard_scroll_step = 0.25
+
+-- Sample WindowServer bounds while physically dragging a managed window.
+PaperWM.drag_poll_fps = 60
 ```
 
 The curve can be changed on the active Spoon at runtime, so experimenting in
@@ -270,6 +306,11 @@ PaperWM.swipe_fingers = 0
 -- increase this number to make windows move farther when swiping
 PaperWM.swipe_gain = 1.0
 
+-- require clear horizontal intent and coordinated movement from most fingers
+PaperWM.swipe_direction_threshold = 0.01
+PaperWM.swipe_direction_ratio = 1.5
+PaperWM.swipe_finger_motion_ratio = 0.5
+
 -- pixels of window travel between haptic ticks; set to 0 to disable
 PaperWM.swipe_haptic_interval = 120
 
@@ -278,6 +319,8 @@ PaperWM.swipe_settle_delay = 0.25
 
 -- continue moving with release velocity; lower friction coasts farther
 PaperWM.swipe_inertia = true
+-- a tiny flick must not coast into another window (normalized trackpad travel)
+PaperWM.swipe_inertia_min_travel = 0.025
 PaperWM.swipe_inertia_friction = 3.5
 PaperWM.swipe_inertia_min_velocity = 40
 PaperWM.swipe_inertia_max_velocity = 6000
@@ -305,10 +348,23 @@ haptic-capable trackpad is active or the trackpad is not being touched.
 
 Native swipes coast with the release velocity and stop at the first or last
 window without changing spacing within the strip. Layout snapping is deferred
-until the fingers, inertia, and settle delay have all finished. A swipe that
-starts during a native resize animation is ignored until that animation ends.
+until the fingers, inertia, and settle delay have all finished. The snap target
+must have a larger fraction of its width visible than the window focused when
+the swipe began. Equal visibility keeps the original window; small swipes return
+it to its original position. Visibility uses the virtual strip coordinates,
+including when distant windows are parked at the screen edge.
+
+Resting contacts are ignored. Starting a trackpad swipe requires net horizontal
+travel, a clear horizontal direction, and coordinated movement from at least
+two thirds of the fingers. A single moving contact among otherwise stationary
+fingers cannot start a swipe. Cancelled or disrupted touch sequences snap back
+without coasting; very short flicks also do not coast. These are motion filters,
+not contact-size palm detection: Hammerspoon does not expose contact size.
+
+A swipe that starts during a native resize animation is ignored until that animation ends.
 Inspect `hs.inspect(PaperWM.events.swipeStatus())` in the Hammerspoon console
-to see the measured release velocity and any reason inertia was skipped.
+to see the measured release velocity, any reason inertia was skipped, and the
+chosen snap window and visibility fractions.
 
 Inspired by [ScrollDesktop.spoon](https://github.com/jocap/ScrollDesktop.spoon)
 
@@ -318,6 +374,23 @@ https://github.com/user-attachments/assets/61a0afda-93e6-41b3-963c-7681a4bbe7c7
 
 Click and drag a window with the mouse while holding the `PaperWM.drag_window`
 hotkey to slide and reposition all the windows on a space.
+
+For ordinary window drags and resizes, PaperWM identifies a managed window on
+the first physical drag event and samples native bounds up to `drag_poll_fps`
+times per second while the mouse button is held. This tracks movement between
+slower Accessibility notifications, although the layout rate remains limited
+by the time needed to retile the other windows. The dragged window follows the
+pointer, even partially off-screen, without PaperWM writing a snapped frame.
+On release it can remain partially off-screen, retaining at least 120 pixels
+within the canvas; focusing another managed window restores normal full-window
+constraints. Its neighbors are moved in one native position batch per reflow,
+with any required resizing animated on release before the final AX handoff.
+When a drag moves the window to another Space or display, release reconciles
+its actual Space assignment and transfers it to that virtual layout without
+replacing its window watcher. Assignment is checked again briefly after release
+to accommodate delayed Mission Control notifications. Inspect
+`hs.inspect(PaperWM.events.dragProbeStatus())` for the last drag's measured
+sampling and reflow rates.
 
 Click on a window with the `PaperWM.lift_window` hotkey held to lift it up, drag
 to move the window, and release the mouse to drop it in a new tiled location.
@@ -337,13 +410,10 @@ MacOS does not allow a window to be moved fully off-screen. Windows that would
 be tiled off-screen are placed in a margin on the left and right edge of the
 screen. They are still visible and clickable.
 
-It's difficult to detect when a window is dragged from one space or screen to
-another. Use the `move_window_N` commands to move windows between spaces and
+Ordinary tracked window drags between Spaces and screens are reconciled at
+release; the `move_window_N` commands remain available for direct transfers.
+Off-canvas neighbors are clamped to their own display even with side-by-side
 screens.
-
-Arrange screens vertically to prevent windows from bleeding into other screens.
-Use [WarpMouse.spoon](https://github.com/mogenson/WarpMouse.spoon) to simulate
-side-by-side screens.
 
 <img width="780" src="https://user-images.githubusercontent.com/900731/148595785-546f9086-9add-4731-8477-233b202378f4.png">
 

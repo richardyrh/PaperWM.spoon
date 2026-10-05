@@ -19,6 +19,7 @@ Events.__index = Events
 -- windowsChanged back-to-back. Tile once after that burst instead of starting
 -- and replacing several animations in the same run-loop turn.
 local pending_layout_timers = {}
+local pending_canvas_updates = {}
 local pending_window_timers = {}
 local swipe_active_spaces = {}
 local layout_debounce <const> = 0.015
@@ -51,18 +52,35 @@ local function scheduleTile(self, space)
     pending_layout_timers[space] = Timer.doAfter(layout_debounce, function()
         pending_layout_timers[space] = nil
         if swipe_active_spaces[space] then return end
-        self.space.tileSpace(space)
+        local previous_canvas = pending_canvas_updates[space]
+        pending_canvas_updates[space] = nil
+        self.space.tileSpace(space, previous_canvas)
     end)
 end
 
-local function tileImmediately(self, space)
-    if swipe_active_spaces[space] then return end
+local function tileImmediately(self, space, previous_canvas, preferred_window)
+    if previous_canvas then
+        pending_canvas_updates[space] = pending_canvas_updates[space] or previous_canvas
+    end
+    if swipe_active_spaces[space] then return false end
     local pending = pending_layout_timers[space]
     if pending then
         pending:stop()
         pending_layout_timers[space] = nil
     end
-    self.space.tileSpace(space)
+    previous_canvas = pending_canvas_updates[space]
+    pending_canvas_updates[space] = nil
+    self.space.tileSpace(space, previous_canvas, nil, preferred_window)
+    return true
+end
+
+---request a layout update, respecting ownership of an active swipe
+---an active swipe applies the current configuration in its normal settle pass
+---@param space Space
+---@param previous_canvas Frame|nil usable bounds before a gap configuration change
+---@param preferred_window Window|nil keyboard shortcut destination
+function Events.retileSpace(space, previous_canvas, preferred_window)
+    return tileImmediately(Events.PaperWM, space, previous_canvas, preferred_window)
 end
 
 local function cancelPendingWindow(id)
@@ -97,26 +115,59 @@ end
 -- space on each one runs the full tiling pass far faster than the screen can
 -- consume, and starting a per-window animation every event means neighbors
 -- chase the drag with a stream of half-finished transitions. Instead, cap the
--- reflow to a steady rate and commit frames immediately (no animation) so
--- neighbors track the drag in lockstep.
+-- reflow to a steady rate and batch native neighbor positions (no animation)
+-- so they track the drag without synchronous AX writes on every tick.
 local last_tile_times = {}
-local resize_throttle <const> = 1 / 30
+local resize_throttle <const> = 1 / 60
+local native_drag_probe = nil
 
 local function tileWithoutAnimation(self, space)
+    local started_at = Timer.absoluteTime()
+    local batching = Events.draggedWindowID(space) and
+        self.windows.beginLiveReflow(space)
+    local layout_started_at = Timer.absoluteTime()
     local saved = Window.animationDuration
     Window.animationDuration = 0
-    local ok, err = pcall(self.space.tileSpace, space)
+    local probe = native_drag_probe
+    local live_screen = probe and probe.space == space and probe.screen
+    local ok, err = pcall(self.space.tileSpace, space, nil, live_screen)
+    local layout_ms = (Timer.absoluteTime() - layout_started_at) / 1000000
     Window.animationDuration = saved
+    if batching then
+        local ended, native_moved, moved_windows, move_error, profile =
+            pcall(self.windows.endLiveReflow, ok)
+        if not ended then
+            move_error = native_moved
+            native_moved, moved_windows = false, 0
+            self.logger.ef("live reflow move failed: %s", move_error)
+        end
+        local probe = native_drag_probe
+        if probe and probe.space == space then
+            local elapsed_ms = (Timer.absoluteTime() - started_at) / 1000000
+            probe.reflows = probe.reflows + 1
+            probe.reflow_total_ms = probe.reflow_total_ms + elapsed_ms
+            probe.reflow_max_ms = math.max(probe.reflow_max_ms, elapsed_ms)
+            probe.layout_total_ms = probe.layout_total_ms + layout_ms
+            probe.bounds_total_ms = probe.bounds_total_ms +
+                ((profile and profile.bounds_ms) or 0)
+            probe.move_total_ms = probe.move_total_ms +
+                ((profile and profile.move_ms) or 0)
+            if native_moved then
+                probe.native_move_batches = probe.native_move_batches + 1
+                probe.native_move_windows = probe.native_move_windows + moved_windows
+            else
+                probe.ax_fallback_batches = probe.ax_fallback_batches + 1
+                probe.last_move_error = move_error
+            end
+        end
+    end
     if not ok then self.logger.ef("tileSpace failed during resize: %s", err) end
 end
 
 local function throttleTile(self, space)
     if swipe_active_spaces[space] then return end
     local pending = pending_layout_timers[space]
-    if pending then
-        pending:stop()
-        pending_layout_timers[space] = nil
-    end
+    if pending then return end
 
     local now = Timer.secondsSinceEpoch()
     local elapsed = now - (last_tile_times[space] or 0)
@@ -153,6 +204,226 @@ end
 ---append a compact diagnostic record from another PaperWM module
 function Events.trace(format, ...)
     if Events.PaperWM then traceDiagnostic(Events.PaperWM, format, ...) end
+end
+
+local mouse_button_down = false
+local drag_candidate_attempted = false
+local drag_owner = nil
+local last_drag_probe_status = nil
+local pending_drag_releases = {}
+
+local function retileVisibleSpace(self, space, preferred_window)
+    local screen = Screen(Spaces.spaceDisplay(space))
+    if screen and Spaces.activeSpaceOnScreen(screen) == space then
+        tileImmediately(self, space, nil, preferred_window)
+    end
+end
+
+local function finishDragRelease(self, window, confirmed_drag)
+    local id = window:id()
+    local release = { window = window }
+    pending_drag_releases[id] = release
+    local function reconcile(attempt)
+        if pending_drag_releases[id] ~= release then return end
+        if not self.state.index_table[id] then
+            pending_drag_releases[id] = nil
+            return
+        end
+        local current, previous = self.windows.reconcileWindowSpace(window)
+        if current then
+            if previous then
+                if self.space.clearDragReleaseOnFocus then
+                    self.space.clearDragReleaseOnFocus(previous, nil)
+                end
+                retileVisibleSpace(self, previous)
+            end
+            if (confirmed_drag and not release.settled) or previous then
+                release.settled = true
+                if self.space.rememberDragRelease then
+                    self.space.rememberDragRelease(current, id)
+                end
+                retileVisibleSpace(self, current, window)
+                if self.windows.flushNativeAnimationBatch then
+                    self.windows.flushNativeAnimationBatch()
+                end
+            end
+        end
+        -- Mission Control can publish the destination after mouse-up. Check
+        -- membership only at release, not at the drag sampling frequency.
+        if attempt < 3 and not previous then
+            release.timer = Timer.doAfter(0.1 * (attempt + 1), function()
+                reconcile(attempt + 1)
+            end)
+        else
+            pending_drag_releases[id] = nil
+        end
+    end
+    reconcile(0)
+end
+
+local function dragProtectsWindow(id)
+    return pending_drag_releases[id] or (mouse_button_down and
+        ((drag_owner and drag_owner.window_id == id) or
+         (native_drag_probe and native_drag_probe.window_id == id)))
+end
+
+local function stopNativeDragProbe(self, finish_layout)
+    local probe = native_drag_probe
+    if not probe then return end
+    native_drag_probe = nil
+    probe.timer:stop()
+    local confirmed_drag = drag_owner and drag_owner.window_id == probe.window_id
+    local pending = pending_layout_timers[probe.space]
+    if pending and confirmed_drag then
+        pending:stop()
+        pending_layout_timers[probe.space] = nil
+    end
+    if self.windows.finishLiveReflow then
+        self.windows.finishLiveReflow(probe.space)
+    end
+    if finish_layout then
+        -- Mission Control can transfer a window without changing the bounds
+        -- read by the probe. Reconcile that drop, but don't settle ordinary
+        -- pointer movement unless it was a confirmed window drag.
+        finishDragRelease(self, probe.window, confirmed_drag)
+    end
+    local elapsed = math.max(0.001, Timer.secondsSinceEpoch() - probe.started_at)
+    last_drag_probe_status = {
+        window_id = probe.window_id,
+        space = probe.space,
+        samples = probe.samples,
+        changed_samples = probe.changed_samples,
+        elapsed_ms = elapsed * 1000,
+        sample_hz = probe.samples / elapsed,
+        reflows = probe.reflows,
+        reflow_hz = probe.reflows / elapsed,
+        average_reflow_ms = probe.reflows > 0 and
+            probe.reflow_total_ms / probe.reflows or 0,
+        max_reflow_ms = probe.reflow_max_ms,
+        average_layout_ms = probe.reflows > 0 and
+            probe.layout_total_ms / probe.reflows or 0,
+        average_bounds_ms = probe.reflows > 0 and
+            probe.bounds_total_ms / probe.reflows or 0,
+        average_move_ms = probe.reflows > 0 and
+            probe.move_total_ms / probe.reflows or 0,
+        native_move_batches = probe.native_move_batches,
+        native_move_windows = probe.native_move_windows,
+        ax_fallback_batches = probe.ax_fallback_batches,
+        last_move_error = probe.last_move_error,
+    }
+    traceDiagnostic(self,
+        "drag native poll window=%d space=%d samples=%d changed=%d elapsed_ms=%.1f sample_hz=%.1f reflow_hz=%.1f avg_reflow_ms=%.2f max_reflow_ms=%.2f avg_layout_ms=%.2f avg_bounds_ms=%.2f avg_move_ms=%.2f native_batches=%d ax_fallbacks=%d",
+        probe.window_id, probe.space, probe.samples,
+        probe.changed_samples, elapsed * 1000, probe.samples / elapsed,
+        probe.reflows / elapsed,
+        probe.reflows > 0 and probe.reflow_total_ms / probe.reflows or 0,
+        probe.reflow_max_ms,
+        probe.reflows > 0 and probe.layout_total_ms / probe.reflows or 0,
+        probe.reflows > 0 and probe.bounds_total_ms / probe.reflows or 0,
+        probe.reflows > 0 and probe.move_total_ms / probe.reflows or 0,
+        probe.native_move_batches,
+        probe.ax_fallback_batches)
+end
+
+---report the last completed native drag sampling cadence
+function Events.dragProbeStatus()
+    return last_drag_probe_status
+end
+
+---the window whose position is controlled by the pointer during a live drag
+function Events.draggedWindowID(space)
+    return mouse_button_down and drag_owner and drag_owner.space == space and
+        drag_owner.window_id or nil
+end
+
+local function startNativeDragProbe(self, window, space, initial_bounds, immediate_tile)
+    if not mouse_button_down or swipe_active_spaces[space] then return false end
+    local id = window:id()
+    local release = pending_drag_releases[id]
+    if release then
+        if release.timer then release.timer:stop() end
+        pending_drag_releases[id] = nil
+    end
+    if native_drag_probe then
+        if native_drag_probe.window_id == id then
+            if native_drag_probe.from_mouse and immediate_tile ~= false then
+                native_drag_probe.from_mouse = false
+                drag_owner = { window_id = id, space = space, window = window }
+                throttleTile(self, space)
+            end
+            return true
+        end
+        if native_drag_probe.from_mouse and
+            native_drag_probe.changed_samples == 0 then
+            -- The focus/overlap candidate was wrong. The first real AX move
+            -- identifies the window the application is actually dragging.
+            stopNativeDragProbe(self, false)
+            drag_owner = nil
+        else
+            return native_drag_probe.space == space
+        end
+    end
+    local bounds = initial_bounds or self.windows.nativeWindowBounds(id)
+    if not bounds then return false end
+
+    local fps = math.max(1, math.min(120, tonumber(self.drag_poll_fps) or 60))
+    local probe = {
+        window_id = id,
+        window = window,
+        space = space,
+        screen = Screen(Spaces.spaceDisplay(space)),
+        frame = bounds,
+        started_at = Timer.secondsSinceEpoch(),
+        samples = 0,
+        changed_samples = 0,
+        from_mouse = immediate_tile == false,
+        reflows = 0,
+        reflow_total_ms = 0,
+        reflow_max_ms = 0,
+        layout_total_ms = 0,
+        bounds_total_ms = 0,
+        move_total_ms = 0,
+        native_move_batches = 0,
+        native_move_windows = 0,
+        ax_fallback_batches = 0,
+    }
+    native_drag_probe = probe
+    if not probe.from_mouse then
+        drag_owner = { window_id = id, space = space, window = window }
+        local pending = pending_layout_timers[space]
+        if pending then
+            pending:stop()
+            pending_layout_timers[space] = nil
+        end
+    end
+    probe.timer = Timer.new(1 / fps, function()
+        if not mouse_button_down or native_drag_probe ~= probe or
+            not self.state.index_table[id] then
+            stopNativeDragProbe(self, false)
+            return
+        end
+        if probe.suspended then return end
+        local current = self.windows.nativeWindowBounds(id)
+        if not current then
+            stopNativeDragProbe(self, false)
+            return
+        end
+        probe.samples = probe.samples + 1
+        if current.x ~= probe.frame.x or current.y ~= probe.frame.y or
+            current.w ~= probe.frame.w or current.h ~= probe.frame.h then
+            probe.frame = current
+            probe.changed_samples = probe.changed_samples + 1
+            -- Pointer motion inside a window (clicks/text selection) is not
+            -- a window drag. Claim reflow only after its bounds actually move.
+            drag_owner = { window_id = id, space = space, window = window }
+            -- AX move notifications may arrive at a lower cadence than the
+            -- WindowServer bounds. The native read supplies intermediate
+            -- positions without another cross-process Accessibility call.
+            throttleTile(self, space)
+        end
+    end):start()
+    if immediate_tile ~= false then throttleTile(self, space) end
+    return true
 end
 
 local function traceSwipe(self, format, ...)
@@ -196,7 +467,10 @@ local function cancelActiveSwipeInertia(next_space)
     traceSwipeStatus(Events.PaperWM, "interrupted")
     local preserve_transform = next_space == inertia.space
     inertia.release(preserve_transform, false)
-    if not preserve_transform then swipe_active_spaces[inertia.space] = nil end
+    if not preserve_transform then
+        swipe_active_spaces[inertia.space] = nil
+        if pending_canvas_updates[inertia.space] then tileImmediately(Events.PaperWM, inertia.space) end
+    end
 end
 
 ---return metrics from the most recent swipe release or rejection
@@ -225,7 +499,7 @@ local function cancelSwipeSettle(space)
     end
 end
 
-local function scheduleSwipeSettle(self, space, screen_frame, retained_transform)
+local function scheduleSwipeSettle(self, space, retained_transform, snap)
     cancelSwipeSettle(space)
     local delay = math.max(0, tonumber(self.swipe_settle_delay) or
         default_swipe_settle_delay)
@@ -236,28 +510,33 @@ local function scheduleSwipeSettle(self, space, screen_frame, retained_transform
         swipe_active_spaces[space] = nil
 
         local focused_window = Window.focusedWindow()
-        if not focused_window then
-            self.logger.e("no focused window at end of swipe")
+
+        -- A focus change during the settle delay belongs to the user, not to
+        -- this swipe. Do not send focus back to an old window or another Space.
+        if not snap or (focused_window and focused_window:id()) ~= snap.focus_id then
+            local focused_index = focused_window and
+                self.state.index_table[focused_window:id()]
+            if focused_index and focused_index.space == space then
+                -- The focus event could not reflow while the swipe owned this
+                -- Space. Replay that layout now, anchored to the user's click.
+                tileImmediately(self, space, nil, focused_window)
+            elseif pending_canvas_updates[space] then
+                tileImmediately(self, space)
+            end
             return
         end
-
-        local frame = self.windows.getWindowFrame(focused_window)
-        local visible_window = nil
-        local focused_offscreen = false
-        if frame.x < screen_frame.x then
-            focused_offscreen = true
-            visible_window = self.windows.getFirstVisibleWindow(
-                space, screen_frame, self.windows.Direction.LEFT)
-        elseif frame.x2 > screen_frame.x2 then
-            focused_offscreen = true
-            visible_window = self.windows.getFirstVisibleWindow(
-                space, screen_frame, self.windows.Direction.RIGHT)
+        local target_index = self.state.index_table[snap.target_id]
+        if not target_index or target_index.space ~= space then
+            tileImmediately(self, space)
+            return
         end
-
-        if visible_window then
-            visible_window:focus()
-        elseif focused_offscreen then
-            self.space.tileSpace(space)
+        if snap.target_id ~= snap.anchor_id then
+            snap.window:focus()
+        else
+            -- Normal tiling only clamps an offscreen anchor to the nearest
+            -- edge. Restore its original position so small swipes cannot drift.
+            self.windows.moveWindow(snap.window, snap.start_frame)
+            tileImmediately(self, space)
         end
     end)
 end
@@ -297,12 +576,22 @@ function Events.windowEventHandler(window, event, self)
     -- hot event path; a hung app can otherwise delay every window event.
     self.logger.df("%s for window id: %d", event, window:id())
     if event == "windowFocused" then
+        if native_drag_probe and native_drag_probe.from_mouse and not drag_owner then
+            -- Do not let the focus animation turn a click candidate into a
+            -- false drag. A real drag can still be claimed by its AX move.
+            stopNativeDragProbe(self, false)
+        end
         self.windows.noteKeyboardFocusEvent(window)
+        local focused_index = self.state.index_table[window:id()]
+        if focused_index and self.space.clearDragReleaseOnFocus then
+            self.space.clearDragReleaseOnFocus(focused_index.space, window:id())
+        end
     end
     -- hs.printf("%s for [%s] id: %d", event, window, window:id() or -1)
     local space = nil
     local tile_immediately = false
     local tile_throttled = false
+    local tile_polled = false
 
     if event == "windowFocused" and
         self.windows.redirectTransientFocus(window) then
@@ -338,6 +627,12 @@ function Events.windowEventHandler(window, event, self)
             return
         end
     elseif event == "windowNotVisible" or event == "windowDestroyed" then
+        if event ~= "windowDestroyed" and dragProtectsWindow(window:id()) then
+            if native_drag_probe and native_drag_probe.window_id == window:id() then
+                native_drag_probe.suspended = true
+            end
+            return
+        end
         cancelPendingWindow(window:id())
         if self.state.index_table[window:id()] then
             space = self.windows.removeWindow(window)
@@ -348,11 +643,18 @@ function Events.windowEventHandler(window, event, self)
             space = self.windows.removeWindow(window, true) -- don't focus new window if fullscreened
         end
     elseif event == "AXWindowMoved" or event == "AXWindowResized" then
+        if self.windows.liveReflowOwnsWindow and
+            self.windows.liveReflowOwnsWindow(window:id()) then
+            return
+        end
         -- This runs on every frame of a live drag/resize, so avoid the slow
         -- private-API space lookup and use the cached space when available.
         local index = self.state.index_table[window:id()]
-        space = index and index.space or Spaces.windowSpaces(window)[1]
-        tile_throttled = true
+        space = index and index.space or (Spaces.windowSpaces(window) or {})[1]
+        if space then
+            tile_polled = startNativeDragProbe(self, window, space)
+            tile_throttled = not tile_polled
+        end
     elseif event == "windowsChanged" or event == "windowNotInCurrentSpace" then
         local all_windows = self.windows.PaperWM.window_filter:getWindows()
         local allowed_ids = {}
@@ -363,7 +665,7 @@ function Events.windowEventHandler(window, event, self)
         -- Collect before removing because removeWindowIndex mutates index_table.
         local removed = {}
         for id, index in pairs(self.state.index_table) do
-            if not allowed_ids[id] then
+            if not allowed_ids[id] and not dragProtectsWindow(id) then
                 table.insert(removed, { id = id, index = index })
             end
         end
@@ -372,6 +674,7 @@ function Events.windowEventHandler(window, event, self)
             if removed_space then scheduleTile(self, removed_space) end
         end
 
+        if mouse_button_down or next(pending_drag_releases) then return end
         local focused_window = Window.focusedWindow()
         local focused_index = focused_window and self.state.index_table[focused_window:id()]
         if focused_index then
@@ -394,11 +697,17 @@ function Events.windowEventHandler(window, event, self)
     end
 
     if space then
-        if tile_throttled then
+        if tile_polled then
+            -- Native bounds polling owns live-drag reflow.
+        elseif tile_throttled then
             throttleTile(self, space)
         elseif tile_immediately then
-            tileImmediately(self, space)
-            self.windows.noteKeyboardLayoutComplete(window)
+            if not (event == "windowFocused" and
+                self.windows.keyboardLayoutAlreadyStarted(window) and
+                not pending_canvas_updates[space]) then
+                tileImmediately(self, space)
+                self.windows.noteKeyboardLayoutComplete(window)
+            end
         else
             scheduleTile(self, space)
         end
@@ -413,20 +722,22 @@ end
 ---@param initial_input_timestamp number|nil gesture begin timestamp in absolute nanoseconds
 ---@param initial_sample_timestamp number gesture begin callback time in absolute nanoseconds
 local function slide_windows(self, space, screen_frame, gesture_started,
-        initial_input_timestamp, initial_sample_timestamp, input_source)
+        initial_input_timestamp, initial_sample_timestamp, input_source,
+        anchor_id, focus_id)
     local left_margin  = screen_frame.x + self.screen_margin
     local right_margin = screen_frame.x2 - self.screen_margin
 
     -- Reuse cached Window objects; reconstructing each one by ID can make a
     -- synchronous Accessibility request before the first gesture frame.
     local windows = {}
+    local anchor_frame
     local x_positions = self.state.x_positions[space] or {}
-    for _, column in ipairs(self.state.window_list[space] or {}) do
-        for _, window in ipairs(column) do
+    for col, column in ipairs(self.state.window_list[space] or {}) do
+        for row, window in ipairs(column) do
             local id = window:id()
             local x = x_positions[id]
             if x then
-                table.insert(windows, { window = window, x = x })
+                table.insert(windows, { window = window, id = id, col = col, row = row, x = x })
             end
         end
     end
@@ -435,13 +746,26 @@ local function slide_windows(self, space, screen_frame, gesture_started,
     traceSwipe(self, "compositor begin active=%s blocked=%s windows=%d",
         tostring(compositor_active), tostring(swipe_blocked), #windows)
     if swipe_blocked then return "blocked" end
+    if not anchor_id then
+        local best_visible = -1
+        for _, item in ipairs(windows) do
+            local visible = Events.Swipe.visibleFraction(
+                item.x, item.frame.w, left_margin, right_margin)
+            if visible > best_visible then
+                anchor_id, best_visible = item.id, visible
+            end
+        end
+    end
     for _, item in ipairs(windows) do
+        if item.id == anchor_id then anchor_frame = Geometry.rect(item.frame) end
         item.applied_x = item.frame and item.frame.x or item.x
         local watcher = self.state.ui_watchers[item.window:id()]
         if watcher then watcher:stop() end
     end
 
     local moved = false
+    local net_delta = 0
+    local cancelled = false
     local velocity = 0
     local last_sample_timestamp = initial_sample_timestamp
     local velocity_samples = 0
@@ -463,6 +787,7 @@ local function slide_windows(self, space, screen_frame, gesture_started,
         if dx == 0 then return 0 end
 
         moved = true
+        net_delta = net_delta + dx
         for _, item in ipairs(windows) do
             item.x = item.x + dx
             -- Keep virtual strip positions unconstrained, but park real
@@ -495,6 +820,38 @@ local function slide_windows(self, space, screen_frame, gesture_started,
             self.windows.endInteractiveMove()
         end
 
+        local snap
+        if settle and moved and anchor_frame then
+            local candidates = {}
+            for _, item in ipairs(windows) do
+                table.insert(candidates, {
+                    id = item.id, col = item.col, row = item.row,
+                    x = item.x, w = item.frame.w, window = item.window,
+                })
+            end
+            local target, anchor_visible, target_visible = Events.Swipe.snapTarget(
+                candidates, anchor_id, cancelled and 0 or net_delta,
+                left_margin, right_margin)
+            if target then
+                snap = {
+                    anchor_id = anchor_id, target_id = target.id,
+                    window = target.window, start_frame = anchor_frame,
+                    focus_id = focus_id,
+                }
+                if last_swipe_status then
+                    last_swipe_status.snap_anchor_id = anchor_id
+                    last_swipe_status.snap_target_id = target.id
+                    last_swipe_status.snap_anchor_visible = anchor_visible
+                    last_swipe_status.snap_target_visible = target_visible
+                    last_swipe_status.net_delta = net_delta
+                end
+                traceDiagnostic(self,
+                    "swipe snap anchor=%d target=%d anchor_visible=%.3f target_visible=%.3f delta=%.3f cancelled=%s",
+                    anchor_id, target.id, anchor_visible, target_visible,
+                    net_delta, tostring(cancelled))
+            end
+        end
+
         for _, item in ipairs(windows) do
             local id = item.window:id()
             if moved then x_positions[id] = item.x end
@@ -507,9 +864,10 @@ local function slide_windows(self, space, screen_frame, gesture_started,
 
         if settle then
             if moved then
-                scheduleSwipeSettle(self, space, screen_frame, retained_transform)
+                scheduleSwipeSettle(self, space, retained_transform, snap)
             else
                 swipe_active_spaces[space] = nil
+                if pending_canvas_updates[space] then tileImmediately(self, space) end
             end
         end
     end
@@ -521,9 +879,16 @@ local function slide_windows(self, space, screen_frame, gesture_started,
         if dx == false then
             releaseOwnership(false, false)
             swipe_active_spaces[space] = nil
+            if pending_canvas_updates[space] then tileImmediately(self, space) end
             return
         end
         if not dx then
+            release_timestamp = input_timestamp
+            release_sample_timestamp = sample_timestamp
+            break
+        end
+        if dx == "cancel" then
+            cancelled = true
             release_timestamp = input_timestamp
             release_sample_timestamp = sample_timestamp
             break
@@ -562,14 +927,21 @@ local function slide_windows(self, space, screen_frame, gesture_started,
         event_release_timestamp = release_timestamp,
         compositor_active = compositor_active,
         inertia_started = false,
+        cancelled = cancelled,
+        net_delta = net_delta,
     }
     traceSwipe(self,
         "release moved=%s compositor=%s velocity=%.3f samples=%d age_ms=%.3f event_begin=%s event_end=%s",
         tostring(moved), tostring(compositor_active), velocity, velocity_samples,
         release_age * 1000, tostring(initial_input_timestamp), tostring(release_timestamp))
 
-    if self.swipe_inertia and moved and release_is_fresh and
-        math.abs(velocity) >= min_velocity then
+    -- Tiny trackpad flicks can have a high release velocity. Require actual
+    -- travel before that velocity is allowed to carry the strip to a new window.
+    local deliberate_travel = input_source ~= "trackpad" or math.abs(net_delta) >=
+        math.max(0, tonumber(self.swipe_inertia_min_travel) or 0.025) *
+        screen_frame.w * math.abs(tonumber(self.swipe_gain) or 1)
+    if self.swipe_inertia and not cancelled and deliberate_travel and moved and
+        release_is_fresh and math.abs(velocity) >= min_velocity then
         local friction = math.max(0.01,
             tonumber(self.swipe_inertia_friction) or 3.5)
         last_swipe_status.inertia_started = true
@@ -623,10 +995,14 @@ local function slide_windows(self, space, screen_frame, gesture_started,
         return
     end
 
-    if not self.swipe_inertia then
+    if cancelled then
+        last_swipe_status.inertia_skipped = "cancelled touch sequence"
+    elseif not self.swipe_inertia then
         last_swipe_status.inertia_skipped = "disabled"
     elseif not moved then
         last_swipe_status.inertia_skipped = "no horizontal movement"
+    elseif not deliberate_travel then
+        last_swipe_status.inertia_skipped = "insufficient deliberate travel"
     elseif not release_is_fresh then
         last_swipe_status.inertia_skipped = "release sample too old"
     else
@@ -642,35 +1018,38 @@ end
 local function beginSlide(self, gesture_started, input_timestamp,
         sample_timestamp, input_source)
     local focused_window = Window.focusedWindow()
-    if not focused_window then
-        self.logger.d("focused window not found")
-        return nil, nil
+    local focus_id = focused_window and focused_window:id()
+    local focused_index = focus_id and self.state.index_table[focus_id]
+    local screen, space
+    if focused_index then
+        space = focused_index.space
+        screen = Screen(Spaces.spaceDisplay(space))
+    else
+        local cursor = Geometry.new(hs.mouse.absolutePosition())
+        screen = Fnutils.find(Screen.allScreens(), function(candidate)
+            return cursor:inside(candidate:frame())
+        end)
+        space = screen and Spaces.activeSpaceOnScreen(screen)
     end
-
-    local focused_index = self.state.index_table[focused_window:id()]
-    if not focused_index then
-        self.logger.e("focused index not found")
-        return nil, nil
-    end
-
-    local screen = Screen(Spaces.spaceDisplay(focused_index.space))
+    if not space or not self.state.window_list[space] then return nil, nil end
     if not screen then
         self.logger.e("no screen for space")
         return nil, nil
     end
 
-    cancelActiveSwipeInertia(focused_index.space)
-    cancelPendingLayout(focused_index.space)
-    cancelSwipeSettle(focused_index.space)
+    cancelActiveSwipeInertia(space)
+    cancelPendingLayout(space)
+    cancelSwipeSettle(space)
 
     local screen_frame = screen:frame()
     local swipe_coro = coroutine.wrap(slide_windows)
     local start_status = swipe_coro(
-        self, focused_index.space, screen_frame, gesture_started,
-        input_timestamp, sample_timestamp, input_source)
+        self, space, screen_frame, gesture_started,
+        input_timestamp, sample_timestamp, input_source,
+        focused_index and focus_id or nil, focus_id)
     if start_status == "blocked" then
         last_swipe_status = {
-            space = focused_index.space,
+            space = space,
             source = input_source,
             blocked = true,
             inertia_started = false,
@@ -679,7 +1058,7 @@ local function beginSlide(self, gesture_started, input_timestamp,
         traceSwipeStatus(self, "blocked")
         return nil, nil
     end
-    swipe_active_spaces[focused_index.space] = true
+    swipe_active_spaces[space] = true
     return swipe_coro, screen_frame
 end
 
@@ -688,7 +1067,7 @@ end
 function Events.swipeHandler(self)
     -- saved upvalues between callback function calls
     local swipe_coro, swipe_id, screen_frame, horizontal = nil, nil, nil, nil
-    local horizontal_travel, vertical_travel, pending_dx = 0, 0, 0
+    local vertical_travel, pending_dx = 0, 0
     local haptic_distance = 0
     local gesture_started, begin_input_timestamp, begin_sample_timestamp
 
@@ -697,7 +1076,7 @@ function Events.swipeHandler(self)
     ---@param type number one of Swipe.BEGIN, Swipe.MOVED, Swipe.END
     ---@param dx number change in horizonal position since last callback: between 0 and 1
     ---@param dy number change in vertical position since last callback: between 0 and 1
-    return function(id, type, dx, dy, input_timestamp)
+    return function(id, type, dx, dy, input_timestamp, touch_info)
         local callback_timestamp = Timer.absoluteTime()
         traceSwipe(self,
             "callback id=%s type=%s dx=%.6f dy=%.6f event_ts=%s callback_ts=%s",
@@ -717,7 +1096,7 @@ function Events.swipeHandler(self)
             swipe_id = id
             screen_frame = nil
             horizontal = nil
-            horizontal_travel, vertical_travel, pending_dx = 0, 0, 0
+            vertical_travel, pending_dx = 0, 0
             haptic_distance = 0
             gesture_started = callback_timestamp
             begin_input_timestamp = input_timestamp
@@ -725,7 +1104,8 @@ function Events.swipeHandler(self)
         elseif swipe_id == id and type == Events.Swipe.END then
             if swipe_coro then
                 self.logger.df("swipe end: %d", id)
-                swipe_coro(nil, input_timestamp, callback_timestamp)
+                swipe_coro(touch_info and touch_info.cancelled and "cancel" or nil,
+                    input_timestamp, callback_timestamp)
             else
                 traceSwipe(self,
                     "candidate end ignored id=%s reason=no horizontal movement",
@@ -739,13 +1119,15 @@ function Events.swipeHandler(self)
             begin_sample_timestamp = nil
         elseif swipe_id == id and type == Events.Swipe.MOVED then
             if horizontal == nil then
-                horizontal_travel = horizontal_travel + math.abs(dx)
                 vertical_travel = vertical_travel + math.abs(dy)
                 pending_dx = pending_dx + dx
                 local direction = Events.Swipe.directionLock(
-                    horizontal_travel, vertical_travel,
-                    tonumber(self.swipe_direction_threshold) or 0.01)
-                if direction ~= true then return end
+                    math.abs(pending_dx), vertical_travel,
+                    tonumber(self.swipe_direction_threshold) or 0.01,
+                    tonumber(self.swipe_direction_ratio) or 1.5)
+                if direction == false then horizontal = false; return end
+                if direction ~= true or
+                    (touch_info and not touch_info.coherent_horizontal) then return end
                 horizontal = true
                 dx, pending_dx = pending_dx, 0
 
@@ -897,7 +1279,10 @@ function Events.mouseHandler(self)
                         return delete_event
                     end
                     drag_coro = coroutine.wrap(slide_windows)
-                    if drag_coro(self, index.space, screen:frame()) == "blocked" then
+                    local focused_window = Window.focusedWindow()
+                    if drag_coro(self, index.space, screen:frame(), nil, nil, nil,
+                            nil, drag_window:id(),
+                            focused_window and focused_window:id()) == "blocked" then
                         drag_coro = nil
                     else
                         self.logger.df("drag window start for: %s", drag_window)
@@ -1009,7 +1394,9 @@ function Events.start()
 
     -- recognize horizontal touchpad swipe gestures
     if Events.PaperWM.swipe_fingers > 1 then
-        Events.Swipe:start(Events.PaperWM.swipe_fingers, Events.swipeHandler(Events.PaperWM))
+        Events.Swipe:start(Events.PaperWM.swipe_fingers, Events.swipeHandler(Events.PaperWM), {
+            finger_motion_ratio = Events.PaperWM.swipe_finger_motion_ratio,
+        })
     end
 
     if Events.PaperWM.mouse_swipe then
@@ -1034,11 +1421,67 @@ function Events.start()
         Events.mouse_watcher = hs.eventtap.new({ LeftMouseDown, LeftMouseDragged, LeftMouseUp },
             Events.mouseHandler(Events.PaperWM)):start()
     end
+
+    -- Only sample native bounds while a physical mouse drag is in progress.
+    -- This listener is passive and does not interfere with application drags.
+    Events.drag_probe_watcher = hs.eventtap.new(
+        { LeftMouseDown, LeftMouseDragged, LeftMouseUp },
+        function(event)
+            local event_type = event:getType()
+            if event_type == LeftMouseDown then
+                mouse_button_down = true
+                drag_candidate_attempted = false
+                drag_owner = nil
+            elseif event_type == LeftMouseDragged then
+                if mouse_button_down and not drag_candidate_attempted and
+                    not native_drag_probe then
+                    drag_candidate_attempted = true
+                    local flags = event.getFlags and event:getFlags()
+                    local custom_drag = flags and flags.containExactly and
+                        ((Events.PaperWM.drag_window and
+                            flags:containExactly(Events.PaperWM.drag_window)) or
+                         (Events.PaperWM.lift_window and
+                            flags:containExactly(Events.PaperWM.lift_window)))
+                    if not custom_drag then
+                        local point = event.location and event:location()
+                        local window, space, bounds =
+                            Events.PaperWM.windows.managedWindowAtPoint(point)
+                        if window then
+                            startNativeDragProbe(Events.PaperWM, window,
+                                space, bounds, false)
+                        end
+                    end
+                end
+            else
+                local released_space = drag_owner and drag_owner.space
+                local released_window = drag_owner and drag_owner.window
+                local had_probe = native_drag_probe ~= nil
+                mouse_button_down = false
+                drag_candidate_attempted = false
+                stopNativeDragProbe(Events.PaperWM, true)
+                drag_owner = nil
+                if released_space and not had_probe then
+                    if Events.PaperWM.windows.finishLiveReflow then
+                        Events.PaperWM.windows.finishLiveReflow(released_space)
+                    end
+                    finishDragRelease(Events.PaperWM, released_window, true)
+                end
+            end
+            return false
+        end):start()
 end
 
 ---stop monitoring for window events
 function Events.stop()
+    for _, release in pairs(pending_drag_releases) do
+        if release.timer then release.timer:stop() end
+    end
+    pending_drag_releases = {}
     cancelActiveSwipeInertia(nil)
+    mouse_button_down = false
+    drag_candidate_attempted = false
+    stopNativeDragProbe(Events.PaperWM, false)
+    drag_owner = nil
 
     -- stop events
     Events.PaperWM.window_filter:unsubscribeAll()
@@ -1057,6 +1500,7 @@ function Events.stop()
         pending_swipe_settles[space] = nil
     end
     swipe_active_spaces = {}
+    pending_canvas_updates = {}
     last_tile_times = {}
 
     -- stop listening for touchpad swipes
@@ -1078,6 +1522,10 @@ function Events.stop()
 
     -- stop listening for mouse events
     if Events.mouse_watcher then Events.mouse_watcher:stop() end
+    if Events.drag_probe_watcher then
+        Events.drag_probe_watcher:stop()
+        Events.drag_probe_watcher = nil
+    end
 end
 
 return Events

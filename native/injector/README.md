@@ -15,8 +15,9 @@ PaperWM-specific and intentionally implements only:
 - multi-window singular presentation transforms; and
 - atomic position/transform commits that never expose the intermediate frame;
   and
-- one-shot multi-window animations driven by `CVDisplayLink` inside Dock; and
-- display-linked interactive sessions that consume the latest swipe target.
+- one-shot multi-window animations driven by `CVDisplayLink` inside Dock;
+- display-linked interactive sessions that consume the latest swipe target; and
+- direct movement of a window to a user Space (used on macOS 27).
 
 For a normal PaperWM layout animation, Hammerspoon sends one request containing
 all window endpoints, duration, and cubic-Bezier control points. The payload
@@ -58,6 +59,21 @@ It also installs a per-user LaunchAgent at
 checks the payload after login and whenever Dock restarts, then invokes the
 single permitted injection command if necessary.
 
+The same user-session agent hosts an optional AX resize service. To use
+`PaperWM.resize_handoff_backend = "service"`, grant Accessibility permission to
+`/Library/PrivilegedHelperTools/paperwm-injector` in System Settings, then
+restart the agent or log out and back in. Check the binary's trust state with:
+
+```sh
+/Library/PrivilegedHelperTools/paperwm-injector --ax-status
+```
+
+The service executes AX requests on its own thread, never in Dock. Its local
+socket is restricted to the logged-in user. The current client waits for a
+bounded response before starting the display-link animation; asynchronous
+transactions and gapless-layout snapshots are planned next. The proven Lua
+handoff remains selected by default.
+
 Check the current payload:
 
 ```sh
@@ -91,6 +107,7 @@ until Dock restarts or the user logs out.
 
 - `/Library/ScriptingAdditions/PaperWM.osax`
 - `/Library/PrivilegedHelperTools/paperwm-injector`
+- `/tmp/paperwm-ax-UID.socket` (while the user agent is running)
 - `/etc/sudoers.d/paperwm-injector-UID`
 - `~/Library/LaunchAgents/org.paperwm.hammerspoon.injector.plist`
 

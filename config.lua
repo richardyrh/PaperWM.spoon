@@ -13,12 +13,15 @@ Config.default_hotkeys = {
     focus_right          = { { "alt", "cmd" }, "right" },
     focus_up             = { { "alt", "cmd" }, "up" },
     focus_down           = { { "alt", "cmd" }, "down" },
+    scroll_left          = { { "ctrl" }, "[" },
+    scroll_right         = { { "ctrl" }, "]" },
     swap_left            = { { "alt", "cmd", "shift" }, "left" },
     swap_right           = { { "alt", "cmd", "shift" }, "right" },
     swap_up              = { { "alt", "cmd", "shift" }, "up" },
     swap_down            = { { "alt", "cmd", "shift" }, "down" },
     center_window        = { { "alt", "cmd" }, "c" },
     full_width           = { { "alt", "cmd" }, "f" },
+    toggle_gaps          = { { "ctrl", "shift" }, "f" },
     cycle_width          = { { "alt", "cmd" }, "r" },
     cycle_height         = { { "alt", "cmd", "shift" }, "r" },
     reverse_cycle_width  = { { "ctrl", "alt", "cmd" }, "r" },
@@ -58,6 +61,12 @@ Config.window_filter = WindowFilter.new():setOverrideFilter({
 ---window gaps: can be set as a single number or a table with top, bottom, left, right values
 Config.window_gap = 8 ---@type number|{ top: number, bottom: number, left: number, right: number }
 
+---apply the configured window gaps; toggle at runtime without losing their sizes
+Config.gaps_enabled = true ---@type boolean
+
+---per-monitor gap overrides keyed by display UUID; runtime toggles are persisted
+Config.gaps_by_screen = {} ---@type table<string, boolean>
+
 ---ratios to use when cycling widths and heights, golden ratio by default
 Config.window_ratios = { 0.23607, 0.38195, 0.61804 } ---@type number[]
 
@@ -66,9 +75,19 @@ Config.window_ratios = { 0.23607, 0.38195, 0.61804 } ---@type number[]
 ---and falls back to Accessibility when neither native route can write
 Config.animation_backend = "native" ---@type "accessibility"|"native"
 
+---"native" runs AX inside Hammerspoon; "service" uses the user LaunchAgent
+---"lua" retains the established path until each native mode is validated
+Config.resize_handoff_backend = "lua" ---@type "lua"|"native"|"service"
+
 ---legacy native and Accessibility position-animation timer frequency;
 ---Dock-backed animations use the display's refresh cadence instead
 Config.animation_fps = 120 ---@type number
+
+---WindowServer bounds sampling rate while a window is being dragged/resized
+Config.drag_poll_fps = 60 ---@type number
+
+---fraction of the screen width panned by each keyboard scroll step
+Config.keyboard_scroll_step = 0.25 ---@type number
 
 ---CSS-style cubic Bezier timing curve: { x1, y1, x2, y2 }
 ---x values must be between 0 and 1; y values may extend beyond that range
@@ -89,6 +108,12 @@ Config.swipe_gain = 1 ---@type number
 
 ---normalized touch travel before locking a trackpad swipe to an axis
 Config.swipe_direction_threshold = 0.01 ---@type number
+
+---horizontal travel must exceed vertical travel by this factor to start a swipe
+Config.swipe_direction_ratio = 1.5 ---@type number
+
+---a majority of fingers must travel this fraction of the average displacement
+Config.swipe_finger_motion_ratio = 0.5 ---@type number
 
 ---accept horizontal RawXY from a Logitech gesture button
 Config.mouse_swipe = false ---@type boolean
@@ -119,6 +144,9 @@ Config.swipe_settle_delay = 0.25 ---@type number
 
 ---continue native swipe movement with release velocity
 Config.swipe_inertia = true ---@type boolean
+
+---minimum trackpad displacement (fraction of screen width, before gain) to coast
+Config.swipe_inertia_min_travel = 0.025 ---@type number
 
 ---exponential velocity decay per second; lower values coast farther
 Config.swipe_inertia_friction = 3.5 ---@type number

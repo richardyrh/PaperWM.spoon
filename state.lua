@@ -4,6 +4,7 @@ State.__index = State
 ---hs.settings key for persisting is_floating, stored as an array of window id
 local IsFloatingKey <const> = "PaperWM_is_floating"
 State.IsFloatingKey = IsFloatingKey
+State.GapsByScreenKey = "PaperWM_gaps_by_screen"
 
 ---array of windows sorted from left to right
 State.window_list = {} -- 3D array of tiles in order of [space][x][y]

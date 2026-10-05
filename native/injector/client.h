@@ -17,6 +17,13 @@ bool paperwm_injector_move(uid_t uid,
                           paperwm_injector_response_t *response,
                           char *error,
                           size_t error_size);
+bool paperwm_injector_window_to_space(
+    uid_t uid,
+    uint32_t window_id,
+    uint64_t space_id,
+    paperwm_injector_response_t *response,
+    char *error,
+    size_t error_size);
 bool paperwm_injector_transform(uid_t uid,
                                const paperwm_injector_transform_t *transforms,
                                uint32_t count,

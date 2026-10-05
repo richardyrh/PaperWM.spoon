@@ -86,6 +86,21 @@ end
 ---collect all of the Mission Control display AXGroup elements
 ---return table|nil, string|nil error
 local function getDisplayGroups()
+    -- macOS 27 moved Mission Control's live accessibility tree out of Dock.
+    local os_version = hs.host and hs.host.operatingSystemVersion()
+    local manager = os_version and os_version.major >= 27 and
+        (Application.applicationsForBundleID("com.apple.WindowManager") or {})[1]
+    if manager then
+        local manager_element = Axuielement.applicationElement(manager)
+        local manager_groups = {}
+        for _, element in ipairs(manager_element or {}) do
+            if element.AXIdentifier == "mc.display" then
+                table.insert(manager_groups, element)
+            end
+        end
+        if #manager_groups > 0 then return manager_groups end
+    end
+
     local mc_group, err = getMissionControlGroup()
     if err or not mc_group then
         return nil, err
@@ -149,6 +164,31 @@ local function getMissionControlSpaces()
     end
 
     return spaces
+end
+
+---press a Space thumbnail in the macOS 27 WindowManager accessibility tree
+---@param space_id number
+---@return boolean
+function MissionControl:pressSpace(space_id)
+    local index = self:getSpaceIndex(space_id)
+    if not index then return false end
+    Spaces.openMissionControl()
+    wait(Spaces.MCwaitTime)
+    local spaces, err = getMissionControlSpaces()
+    local thumbnail = spaces and spaces[index]
+    if not thumbnail then
+        self.log.ef("could not find Mission Control Space %d: %s",
+            space_id, tostring(err))
+        Spaces.closeMissionControl()
+        return false
+    end
+    local pressed = thumbnail:performAction("AXPress")
+    if not pressed then
+        self.log.ef("could not press Mission Control Space %d", space_id)
+        Spaces.closeMissionControl()
+        return false
+    end
+    return true
 end
 
 ---calculate which index in the getMissionControlSpaces list corresponds to a
@@ -274,7 +314,12 @@ function MissionControl:focusSpace(space_id, window)
     end
 
     if Spaces.focusedSpace() ~= space_id then
-        Spaces.gotoSpace(space_id)
+        local os_version = hs.host and hs.host.operatingSystemVersion()
+        if os_version and os_version.major >= 27 then
+            self:pressSpace(space_id)
+        else
+            Spaces.gotoSpace(space_id)
+        end
     end
 
     local do_window_focus = coroutine.wrap(function()

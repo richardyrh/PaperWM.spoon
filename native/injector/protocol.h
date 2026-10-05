@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #define PAPERWM_INJECTOR_PROTOCOL_VERSION 1
-#define PAPERWM_INJECTOR_PAYLOAD_VERSION "0.3.0"
+#define PAPERWM_INJECTOR_PAYLOAD_VERSION "0.4.0"
 #define PAPERWM_INJECTOR_SOCKET_FMT "/tmp/paperwm-sa-%u.socket"
 #define PAPERWM_INJECTOR_MAX_MESSAGE UINT16_MAX
 #define PAPERWM_INJECTOR_RESPONSE_MAGIC 0x31574d50u /* PWM1 */
@@ -18,6 +18,7 @@ enum paperwm_injector_opcode {
     PAPERWM_INJECTOR_OP_INTERACTIVE_BEGIN = 0x06,
     PAPERWM_INJECTOR_OP_INTERACTIVE_UPDATE = 0x07,
     PAPERWM_INJECTOR_OP_INTERACTIVE_END = 0x08,
+    PAPERWM_INJECTOR_OP_WINDOW_TO_SPACE = 0x09,
 };
 
 enum paperwm_injector_capability {
@@ -26,6 +27,7 @@ enum paperwm_injector_capability {
     PAPERWM_INJECTOR_CAP_COMMIT = 1u << 2,
     PAPERWM_INJECTOR_CAP_ANIMATE = 1u << 3,
     PAPERWM_INJECTOR_CAP_INTERACTIVE = 1u << 4,
+    PAPERWM_INJECTOR_CAP_WINDOW_TO_SPACE = 1u << 5,
 };
 
 enum paperwm_injector_status {
@@ -49,6 +51,11 @@ typedef struct paperwm_injector_move {
     double x;
     double y;
 } paperwm_injector_move_t;
+
+typedef struct paperwm_injector_window_to_space {
+    uint64_t space_id;
+    uint32_t window_id;
+} paperwm_injector_window_to_space_t;
 
 typedef struct paperwm_injector_transform {
     uint32_t window_id;

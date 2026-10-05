@@ -1,5 +1,7 @@
 #import <AppKit/AppKit.h>
+#include <ApplicationServices/ApplicationServices.h>
 
+#include "ax_service.h"
 #include "client.h"
 
 #include <errno.h>
@@ -106,6 +108,14 @@ static bool payload_ready(uid_t uid,
             uid, &local, error, error_size)) {
         return false;
     }
+    if (strcmp(local.payload_version, PAPERWM_INJECTOR_PAYLOAD_VERSION) != 0) {
+        snprintf(error,
+                 error_size,
+                 "payload version %s does not match installed helper %s",
+                 local.payload_version,
+                 PAPERWM_INJECTOR_PAYLOAD_VERSION);
+        return false;
+    }
     uint32_t required = PAPERWM_INJECTOR_CAP_MOVE |
                         PAPERWM_INJECTOR_CAP_TRANSFORM |
                         PAPERWM_INJECTOR_CAP_COMMIT |
@@ -190,6 +200,10 @@ static int monitor_payload(void)
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
 
+    if (!paperwm_ax_service_start()) {
+        fprintf(stderr, "AX resize service could not start; Dock monitoring continues\n");
+    }
+
     uid_t uid = getuid();
     pid_t active_dock_pid = 0;
     unsigned int ticks = 0;
@@ -233,6 +247,7 @@ static int monitor_payload(void)
             usleep(250000);
         }
     }
+    paperwm_ax_service_stop();
     return 0;
 }
 
@@ -255,7 +270,7 @@ static int print_status(void)
 
 static void usage(const char *program)
 {
-    fprintf(stderr, "usage: %s --monitor | --inject | --status\n", program);
+    fprintf(stderr, "usage: %s --monitor | --inject | --status | --ax-status\n", program);
 }
 
 int main(int argc, char **argv)
@@ -268,6 +283,11 @@ int main(int argc, char **argv)
         if (strcmp(argv[1], "--monitor") == 0) return monitor_payload();
         if (strcmp(argv[1], "--inject") == 0) return inject_payload();
         if (strcmp(argv[1], "--status") == 0) return print_status();
+        if (strcmp(argv[1], "--ax-status") == 0) {
+            bool trusted = AXIsProcessTrusted();
+            printf("accessibility_trusted=%s\n", trusted ? "true" : "false");
+            return trusted ? 0 : 1;
+        }
         usage(argv[0]);
         return 2;
     }

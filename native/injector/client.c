@@ -174,6 +174,26 @@ bool paperwm_injector_handshake(uid_t uid,
                    error_size);
 }
 
+bool paperwm_injector_window_to_space(
+    uid_t uid,
+    uint32_t window_id,
+    uint64_t space_id,
+    paperwm_injector_response_t *response,
+    char *error,
+    size_t error_size)
+{
+    paperwm_injector_window_to_space_t move = {0};
+    move.space_id = space_id;
+    move.window_id = window_id;
+    return request(uid,
+                   PAPERWM_INJECTOR_OP_WINDOW_TO_SPACE,
+                   &move,
+                   sizeof(move),
+                   response,
+                   error,
+                   error_size);
+}
+
 static bool array_request(uid_t uid,
                           uint8_t opcode,
                           const void *items,

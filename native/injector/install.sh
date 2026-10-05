@@ -48,9 +48,11 @@ if [[ ! -x "$BUILD_DIR/PaperWM.osax/Contents/MacOS/loader" ||
     exit 1
 fi
 
-updated_install=false
-if [[ -e "$OSAX/Contents/MacOS/loader" ]]; then
-    updated_install=true
+restart_dock=false
+installed_payload="$OSAX/Contents/Resources/payload.bundle/Contents/MacOS/payload"
+new_payload="$BUILD_DIR/PaperWM.osax/Contents/Resources/payload.bundle/Contents/MacOS/payload"
+if [[ -e "$installed_payload" ]] && ! cmp -s "$installed_payload" "$new_payload"; then
+    restart_dock=true
 fi
 
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/paperwm-injector.XXXXXX")
@@ -105,7 +107,7 @@ plutil -lint "$temporary/$LABEL.plist"
 install -m 0644 "$temporary/$LABEL.plist" "$LAUNCH_AGENT"
 
 unload_agent
-if $updated_install; then
+if $restart_dock; then
     print "Restarting Dock once to activate the updated payload..."
     /usr/bin/killall Dock >/dev/null 2>&1 || true
 fi

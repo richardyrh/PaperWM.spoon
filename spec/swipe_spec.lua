@@ -94,9 +94,125 @@ describe("PaperWM.swipe", function()
             assert.is_true(Swipe.directionLock(15, 4, 12))
             assert.is_false(Swipe.directionLock(4, 15, 12))
         end)
+
+        it("waits for clear axis dominance when a ratio is configured", function()
+            assert.is_nil(Swipe.directionLock(0.02, 0.018, 0.01, 1.5))
+            assert.is_true(Swipe.directionLock(0.03, 0.01, 0.01, 1.5))
+            assert.is_false(Swipe.directionLock(0.01, 0.03, 0.01, 1.5))
+        end)
+    end)
+
+    describe("snapTarget", function()
+        local function item(id, col, x, width, row)
+            return { id = id, col = col, row = row or 1, x = x, w = width }
+        end
+
+        it("keeps the current window after a small move offscreen", function()
+            local target = Swipe.snapTarget({
+                item(1, 1, -20, 1000), item(2, 2, 990, 1000),
+            }, 1, -20, 0, 1000)
+            assert.are.equal(1, target.id)
+        end)
+
+        it("changes only after the destination is more visible", function()
+            local target, anchor_visible, target_visible = Swipe.snapTarget({
+                item(1, 1, -600, 1000), item(2, 2, 410, 1000),
+            }, 1, -600, 0, 1000)
+            assert.are.equal(2, target.id)
+            assert.is_true(target_visible > anchor_visible)
+        end)
+
+        it("keeps exact ties on the starting window", function()
+            local target = Swipe.snapTarget({
+                item(1, 1, -505, 1000), item(2, 2, 505, 1000),
+            }, 1, -505, 0, 1000)
+            assert.are.equal(1, target.id)
+        end)
+
+        it("compares proportions instead of pixel counts for unequal widths", function()
+            local target = Swipe.snapTarget({
+                item(1, 1, -500, 1000), item(2, 2, 510, 400),
+            }, 1, -500, 0, 1000)
+            assert.are.equal(2, target.id)
+        end)
+
+        it("supports positive and negative display origins and both directions", function()
+            for _, left in ipairs({ -2000, 2000 }) do
+                local target = Swipe.snapTarget({
+                    item(1, 1, left - 410, 1000), item(2, 2, left + 600, 1000),
+                }, 2, 600, left, left + 1000)
+                assert.are.equal(1, target.id)
+            end
+        end)
+
+        it("ignores hidden virtual columns and candidates behind the movement", function()
+            local target = Swipe.snapTarget({
+                item(1, 1, 0, 100), item(2, 2, -600, 1000),
+                item(3, 3, 410, 1000), item(4, 4, 1420, 1000),
+            }, 2, -600, 0, 1000)
+            assert.are.equal(3, target.id)
+        end)
+
+        it("chooses the nearest winning column and preserves the row where possible", function()
+            local target = Swipe.snapTarget({
+                item(1, 1, -900, 1000, 2), item(2, 2, 110, 300, 1),
+                item(3, 2, 110, 300, 2), item(4, 3, 420, 300, 1),
+            }, 1, -900, 0, 1000)
+            assert.are.equal(3, target.id)
+        end)
+    end)
+
+    describe("coherentMotion", function()
+        it("rejects a single moving contact and opposite finger movement", function()
+            assert.is_false(Swipe.coherentMotion({ 0.04, 0, 0 }, 0.5))
+            assert.is_false(Swipe.coherentMotion({ 0.04, -0.04, 0 }, 0.5))
+        end)
+
+        it("accepts coordinated fingers even if one is stationary", function()
+            assert.is_true(Swipe.coherentMotion({ 0.02, 0.018, 0 }, 0.5))
+            assert.is_true(Swipe.coherentMotion({ -0.02, -0.018, 0 }, 0.5))
+            assert.is_true(Swipe.coherentMotion({ 0.02, 0.019 }, 0.5))
+        end)
     end)
 
     describe("gesture lifecycle", function()
+        it("ignores resting contacts and tracks accumulated motion through stationary packets", function()
+            local tap_callback
+            hs.eventtap.new = function(_, callback)
+                tap_callback = callback
+                return { start = function() end, stop = function() end }
+            end
+            local calls = {}
+            Swipe:start(3, function(_, kind, dx, _, _, info)
+                table.insert(calls, { kind = kind, dx = dx, info = info })
+            end)
+            local function touch(id, x, phase, resting)
+                return { identity = id, normalizedPosition = { x = x, y = 0.5 },
+                    phase = phase, resting = resting, type = "indirect" }
+            end
+            local function send(touches)
+                tap_callback({ getType = function() return 1 end,
+                    getTouches = function() return touches end,
+                    timestamp = function() return 1 end })
+            end
+            send({ touch(1, 0.2, "began"), touch(2, 0.3, "began"),
+                touch(3, 0.4, "began", true) })
+            assert.are.equal(0, #calls)
+            send({ touch(1, 0.2, "began"), touch(2, 0.3, "began"),
+                touch(3, 0.4, "began"), touch(4, 0.5, "stationary", true) })
+            send({ touch(1, 0.23, "moved"), touch(2, 0.3, "stationary"),
+                touch(3, 0.4, "stationary") })
+            assert.is_false(calls[2].info.coherent_horizontal)
+            send({ touch(1, 0.23, "stationary"), touch(2, 0.33, "moved"),
+                touch(3, 0.4, "stationary") })
+            assert.is_true(calls[3].info.coherent_horizontal)
+            send({ touch(1, 0.23, "stationary"), touch(2, 0.33, "stationary", true),
+                touch(3, 0.4, "stationary") })
+            assert.are.equal(Swipe.END, calls[4].kind)
+            assert.is_true(calls[4].info.cancelled)
+            Swipe:stop()
+        end)
+
         it("debounces empty packets and ends on a sustained empty lift", function()
             local tap_callback
             local pending_end

@@ -83,15 +83,71 @@ end
 ---@param horizontal number accumulated absolute horizontal travel
 ---@param vertical number accumulated absolute vertical travel
 ---@param threshold number minimum accumulated travel before locking
+---@param ratio number|nil required axis dominance, defaults to 1
 ---@return boolean|nil horizontal
-function Swipe.directionLock(horizontal, vertical, threshold)
+function Swipe.directionLock(horizontal, vertical, threshold, ratio)
     horizontal = math.max(0, tonumber(horizontal) or 0)
     vertical = math.max(0, tonumber(vertical) or 0)
     threshold = math.max(0, tonumber(threshold) or 0)
     if horizontal + vertical < threshold then return nil end
-    return horizontal > vertical
+    ratio = math.max(1, tonumber(ratio) or 1)
+    if ratio == 1 then return horizontal > vertical end
+    if horizontal > vertical * ratio then return true end
+    if vertical > horizontal * ratio then return false end
+    return nil
 end
 
+---fraction of a window's width visible in the viewport
+function Swipe.visibleFraction(x, width, left, right)
+    if width <= 0 then return 0 end
+    return math.max(0, math.min(x + width, right) - math.max(x, left)) / width
+end
+
+---choose a more visible window in the direction travelled, keeping ties on the anchor
+---items use virtual strip coordinates, never the parked offscreen window positions
+function Swipe.snapTarget(items, anchor_id, delta, left, right)
+    local anchor
+    for _, item in ipairs(items) do
+        if item.id == anchor_id then anchor = item; break end
+    end
+    if not anchor then return nil end
+
+    local anchor_visible = Swipe.visibleFraction(anchor.x, anchor.w, left, right)
+    local best, best_visible = anchor, anchor_visible
+    for _, item in ipairs(items) do
+        if (item.col - anchor.col) * delta < 0 then
+            local visible = Swipe.visibleFraction(item.x, item.w, left, right)
+            local better = visible > best_visible + 0.000001
+            local tied = best ~= anchor and math.abs(visible - best_visible) <= 0.000001
+            local nearer = math.abs(item.col - anchor.col) < math.abs(best.col - anchor.col)
+            local nearer_row = item.col == best.col and
+                math.abs((item.row or 1) - (anchor.row or 1)) <
+                math.abs((best.row or 1) - (anchor.row or 1))
+            if better or (tied and (nearer or nearer_row)) then
+                best, best_visible = item, visible
+            end
+        end
+    end
+    return best, anchor_visible, best_visible
+end
+
+---require a majority of fingers to have accumulated movement with the centroid
+---use total displacement so stationary fingers in individual packets remain valid
+function Swipe.coherentMotion(displacements, ratio)
+    if #displacements == 0 then return false end
+    local mean = 0
+    for _, dx in ipairs(displacements) do mean = mean + dx end
+    mean = mean / #displacements
+    if math.abs(mean) < 0.000001 then return false end
+    ratio = math.max(0, math.min(1, tonumber(ratio) or 0.5))
+    local agreeing = 0
+    for _, dx in ipairs(displacements) do
+        if dx * mean > 0 and math.abs(dx) >= math.abs(mean) * ratio then
+            agreeing = agreeing + 1
+        end
+    end
+    return agreeing >= math.ceil(#displacements * 2 / 3)
+end
 
 local Cache = { id = nil, direction = nil, distance = 0, size = 0, touches = {} }
 
@@ -132,6 +188,7 @@ function Cache:set(touches)
         self.touches[touch.identity] = {
             x = touch.normalizedPosition.x,
             y = touch.normalizedPosition.y,
+            start_x = touch.normalizedPosition.x,
             dx = 0,
             dy = 0,
         }
@@ -141,10 +198,11 @@ function Cache:set(touches)
     return self.id
 end
 
-function Cache:detect(touches)
+function Cache:detect(touches, coherence_ratio)
     local moved = false
     local delta = { dx = 0, dy = 0 }
     local size = 0
+    local displacements = {}
     for i, touch in ipairs(touches) do
         local id = touch.identity
         local x, y = touch.normalizedPosition.x, touch.normalizedPosition.y
@@ -155,31 +213,42 @@ function Cache:detect(touches)
         -- finger to move discarded samples while advancing the cache.
         moved = moved or (touch.phase == "moved")
         delta = { dx = delta.dx + dx, dy = delta.dy + dy }
-        self.touches[id] = { x = x, y = y, dx = dx, dy = dy }
+        local start_x = self.touches[id].start_x
+        self.touches[id] = { x = x, y = y, dx = dx, dy = dy, start_x = start_x }
+        displacements[i] = x - start_x
         size = i
     end
 
     assert(self.size == size)
     delta = { dx = delta.dx / size, dy = delta.dy / size }
 
-    return moved, delta, self.id
+    return moved, delta, self.id, Swipe.coherentMotion(displacements, coherence_ratio)
 end
 
 -- fingers: number of fingers for swipe (must be at least 2)
--- callback: function(type, distance, id) end
+-- callback: function(id, type, dx, dy, timestamp, touch_info) end
 --           id is a unique id across callbacks for the same swipe
 --           type is Swipe.type { BEGIN, MOVED, END}
 --           dx change in horizontal position between 0.0 and 1.0
 --           dy change in vertical position between 0.0 and 1.0
 local gesture <const> = hs.eventtap.event.types.gesture
-function Swipe:start(fingers, callback)
+function Swipe:start(fingers, callback, options)
     assert(fingers > 1)
     assert(callback)
+    options = options or {}
 
     self.watcher = hs.eventtap.new({ gesture }, function(event)
         local type = event:getType(true)
         if type ~= gesture then return end
-        local touches = event:getTouches()
+        local raw_touches = event:getTouches() or {}
+        local touches, resting_active = {}, false
+        for _, touch in ipairs(raw_touches) do
+            if touch.resting then
+                resting_active = resting_active or Cache.touches[touch.identity] ~= nil
+            elseif touch.type ~= "direct" and touch.normalizedPosition then
+                table.insert(touches, touch)
+            end
+        end
         if self.trace then
             local phases = {}
             for _, touch in ipairs(touches) do
@@ -190,7 +259,7 @@ function Swipe:start(fingers, callback)
                 #touches, table.concat(phases, ","), tostring(event:timestamp()))
         end
 
-        if #touches == 0 and Cache.id then
+        if #touches == 0 and Cache.id and not resting_active then
             local id, timestamp = Cache.id, event:timestamp()
             if self.pending_end then self.pending_end:stop() end
             self.pending_end = hs.timer.doAfter(0.05, function()
@@ -206,11 +275,11 @@ function Swipe:start(fingers, callback)
             self.pending_end = nil
         end
 
-        local terminal_phase = false
+        local terminal_phase, cancelled = false, resting_active
         for _, touch in ipairs(touches) do
+            if touch.phase == "cancelled" then cancelled = true end
             if touch.phase == "ended" or touch.phase == "cancelled" then
                 terminal_phase = true
-                break
             end
         end
 
@@ -218,18 +287,21 @@ function Swipe:start(fingers, callback)
         -- ended phase. The previous overlap-only check missed both cases and
         -- left the gesture without an END callback or release velocity.
         if Cache.id and (#touches ~= fingers or not Cache:all(touches) or
-                terminal_phase) then
-            callback(Cache.id, Swipe.END, 0, 0, event:timestamp())
+                terminal_phase or resting_active) then
+            cancelled = cancelled or #touches > fingers or
+                (#touches == fingers and not Cache:all(touches))
+            callback(Cache.id, Swipe.END, 0, 0, event:timestamp(), { cancelled = cancelled })
             Cache:clear()
         end
 
-        if terminal_phase then return end
+        if terminal_phase or cancelled then return end
         if not Cache.id and #touches == fingers then
             callback(Cache:set(touches), Swipe.BEGIN, 0, 0, event:timestamp())
         elseif Cache.id and Cache:all(touches) then
-            local moved, delta, id = Cache:detect(touches)
+            local moved, delta, id, coherent = Cache:detect(touches, options.finger_motion_ratio)
             if moved then
-                callback(id, Swipe.MOVED, delta.dx, delta.dy, event:timestamp())
+                callback(id, Swipe.MOVED, delta.dx, delta.dy, event:timestamp(),
+                    { coherent_horizontal = coherent })
             end
         end
     end)

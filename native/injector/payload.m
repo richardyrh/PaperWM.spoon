@@ -33,6 +33,9 @@ typedef CGError (*SLSMoveWindowWithGroupFn)(SLSConnectionID,
                                             const CGPoint *);
 typedef CGError (*SLSDisableUpdateFn)(SLSConnectionID);
 typedef CGError (*SLSReenableUpdateFn)(SLSConnectionID);
+typedef void (*SLSMoveWindowsToManagedSpaceFn)(SLSConnectionID,
+                                               CFArrayRef,
+                                               uint64_t);
 
 static void *skylight_handle;
 static SLSMainConnectionIDFn sls_main_connection_id;
@@ -42,6 +45,7 @@ static SLSSetWindowTransformFn sls_set_window_transform;
 static SLSMoveWindowWithGroupFn sls_move_window_with_group;
 static SLSDisableUpdateFn sls_disable_update;
 static SLSReenableUpdateFn sls_reenable_update;
+static SLSMoveWindowsToManagedSpaceFn sls_move_windows_to_managed_space;
 static int server_fd = -1;
 static char socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
 
@@ -163,6 +167,9 @@ static bool load_skylight(void)
         sls_reenable_update =
             (SLSReenableUpdateFn)dlsym(skylight_handle, "CGSReenableUpdate");
     }
+    sls_move_windows_to_managed_space =
+        (SLSMoveWindowsToManagedSpaceFn)dlsym(
+            skylight_handle, "SLSMoveWindowsToManagedSpace");
 
     if (!sls_main_connection_id || !sls_get_window_bounds ||
         !sls_get_window_transform || !sls_set_window_transform ||
@@ -182,6 +189,9 @@ static paperwm_injector_response_t response(uint16_t status, int32_t error)
                             PAPERWM_INJECTOR_CAP_INTERACTIVE;
     if (sls_disable_update && sls_reenable_update) {
         capabilities |= PAPERWM_INJECTOR_CAP_COMMIT;
+    }
+    if (sls_move_windows_to_managed_space) {
+        capabilities |= PAPERWM_INJECTOR_CAP_WINDOW_TO_SPACE;
     }
     paperwm_injector_response_t value = {
         .magic = PAPERWM_INJECTOR_RESPONSE_MAGIC,
@@ -246,6 +256,34 @@ static CGError perform_moves(const uint8_t *payload, size_t payload_size)
 
     free(moves);
     return error;
+}
+
+static CGError perform_window_to_space(const uint8_t *payload,
+                                       size_t payload_size)
+{
+    if (payload_size != sizeof(paperwm_injector_window_to_space_t)) {
+        return kCGErrorIllegalArgument;
+    }
+    if (!sls_move_windows_to_managed_space) return kCGErrorNotImplemented;
+
+    paperwm_injector_window_to_space_t move;
+    memcpy(&move, payload, sizeof(move));
+    if (!move.window_id || !move.space_id) return kCGErrorIllegalArgument;
+
+    int32_t window_id = (int32_t)move.window_id;
+    CFNumberRef window = CFNumberCreate(
+        kCFAllocatorDefault, kCFNumberSInt32Type, &window_id);
+    if (!window) return kCGErrorFailure;
+    CFArrayRef windows = CFArrayCreate(
+        kCFAllocatorDefault, (const void **)&window, 1,
+        &kCFTypeArrayCallBacks);
+    CFRelease(window);
+    if (!windows) return kCGErrorFailure;
+
+    sls_move_windows_to_managed_space(
+        sls_main_connection_id(), windows, move.space_id);
+    CFRelease(windows);
+    return kCGErrorSuccess;
 }
 
 static bool transforms_equal(CGAffineTransform left, CGAffineTransform right)
@@ -1118,6 +1156,9 @@ static paperwm_injector_response_t handle_message(const uint8_t *message,
         break;
     case PAPERWM_INJECTOR_OP_INTERACTIVE_END:
         error = perform_interactive_end(payload, payload_size);
+        break;
+    case PAPERWM_INJECTOR_OP_WINDOW_TO_SPACE:
+        error = perform_window_to_space(payload, payload_size);
         break;
     default:
         return response(PAPERWM_INJECTOR_STATUS_UNSUPPORTED, ENOTSUP);
