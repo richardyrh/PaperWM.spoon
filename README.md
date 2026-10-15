@@ -96,6 +96,9 @@ PaperWM:bindHotkeys({
     -- move the focused window into / out of the tiling layer
     toggle_floating = {{"alt", "cmd", "shift"}, "escape"},
 
+    -- bring unmanaged windows forward in the focused Space
+    raise_unmanaged = {{"ctrl", "shift"}, "u"},
+
     -- focus the first / second / etc window in the current space
     focus_window_1 = {{"cmd", "shift"}, "1"},
     focus_window_2 = {{"cmd", "shift"}, "2"},
@@ -138,6 +141,11 @@ Feel free to customize hotkeys or use
 `PaperWM:bindHotkeys(PaperWM.default_hotkeys)` for defaults. PaperWM actions are
 also available for manual keybinding. The `PaperWM.actions.actions()` function
 will return a table of action names and functions to call.
+
+`raise_unmanaged` raises visible windows outside PaperWM's tiling layer (including
+floating windows and excluded apps) in the focused Space. It preserves their
+stacking order and focuses the frontmost unmanaged window. It does not change the managed layout,
+unhide apps, or restore minimized windows.
 
 For example, the following config uses a hyper key and a modal layer to navigate
 windows with the h/j/k/l keys, like vim:
@@ -275,6 +283,28 @@ PaperWM.window_filter:setScreens({ "Built%-in Retina Display" })
 -- restart for new window filter to take effect
 PaperWM:start()
 ```
+
+When using WarpMouse's virtual layout editor, you can also assign desktop numbers
+per display. Those persisted assignments change the targets of `move_window_N`
+and `switch_space_N` and the order used by previous/next Space navigation, without
+changing macOS Desktop labels or Mission Control's thumbnail order. Blank numbers
+retain automatic numbering. Existing keyboard bindings are unchanged.
+
+PaperWM also checks resize capabilities before admitting a window. A non-writable
+`AXSize` is rejected. The default `PaperWM.resize_control_filter = true` additionally
+rejects an explicitly disabled grow area, or a disabled zoom button with no enabled
+grow/fullscreen control. These controls are hints, not an authoritative cross-app
+resizability flag; missing/erroring metadata is allowed. Set this option to `false`
+for apps that disable these controls while still supporting manual resizing.
+
+As a fallback, existing resize writes/readbacks are observed without issuing test
+resizes. Repeated, unchanged sizes after meaningful requests to both grow and shrink
+on both axes (at least three observations over two seconds) leave only that window
+unmanaged and clear its GPU transform. One-sided minimum/maximum clamps, partial
+resize progress, and unavailable reads do not count as proof of a fixed size. The
+learned exclusion lasts until the window is destroyed or Hammerspoon reloads;
+`PaperWM.windows.clearResizeBlacklist()` clears it manually. Ordinary position-only
+navigation adds no AX capability/readback queries.
 
 Set `PaperWM.center_mouse` to control whether the mouse cursor is centered on
 the screen after switching spaces. Default is `true`. Example:

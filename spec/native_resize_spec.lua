@@ -428,4 +428,70 @@ describe("PaperWM native resize handoff", function()
         advance(0)
         assert.is_true(animations[1].auto_commit)
     end)
+
+    local function trackedWindow()
+        local state = Windows.PaperWM.state
+        state.index_table[1] = { space = 3, col = 1, row = 1 }
+        state.window_list = { [3] = { { window } } }
+        state.x_positions = { [3] = { [1] = 100 } }
+        Windows.PaperWM.tileSpace = function() end
+    end
+
+    it("removes a refused window and clears its transform before another animation", function()
+        trackedWindow()
+        resize_mode = "pending"
+        local before = rect(backing)
+        Windows.noteResizeResult(window, before, rect(100, 24, 1300, 1150), before)
+        advance(1)
+        Windows.noteResizeResult(window, before, target, before)
+        advance(1)
+        Windows.moveWindow(window, target)
+        assert.is_false(Windows.isResizable(window))
+        advance(0)
+        assert.is_nil(Windows.PaperWM.state.index_table[1])
+        assert.is_nil(Windows.PaperWM.state.ui_watchers[1])
+        assert.is_nil(Windows.PaperWM.state.window_list[3])
+        assert.are.equal(1, transforms[#transforms].sx)
+        assert.are.equal(1, transforms[#transforms].sy)
+        assert.is_true(ax_app.enhanced)
+        advance(0)
+        assert.are.equal(0, #animations)
+        local count = #operations
+        Windows.moveWindow(window, target)
+        assert.are.equal(count, #operations)
+    end)
+
+    it("also excludes a refused window during final commit, releasing update locks", function()
+        trackedWindow()
+        resize_mode = "pending"
+        local before = rect(backing)
+        Windows.noteResizeResult(window, before, rect(100, 24, 1300, 1150), before)
+        advance(1)
+        Windows.moveWindow(window, target)
+        assert.is_true(Windows.isResizable(window))
+        advance(1.6)
+        assert.is_false(Windows.isResizable(window))
+        advance(0)
+        assert.is_nil(Windows.PaperWM.state.index_table[1])
+        assert.are.equal(1, transforms[#transforms].sx)
+        assert.are.equal(1, transforms[#transforms].sy)
+        assert.is_true(ax_app.enhanced)
+        assert.are.equal("unlock", operations[#operations])
+    end)
+
+    it("observes the AX backend without starting a native transform", function()
+        trackedWindow()
+        Windows.PaperWM.animation_backend = "accessibility"
+        local before = rect(backing)
+        Windows.noteResizeResult(window, before, rect(100, 24, 1300, 1150), before)
+        advance(1)
+        Windows.noteResizeResult(window, before, target, before)
+        advance(1)
+        window.setFrame = function() return window end
+        Windows.moveWindow(window, target)
+        advance(0.7)
+        assert.is_false(Windows.isResizable(window))
+        assert.is_nil(Windows.PaperWM.state.index_table[1])
+        assert.are.equal(0, #transforms)
+    end)
 end)

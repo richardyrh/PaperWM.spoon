@@ -169,6 +169,17 @@ describe("PaperWM.windows", function()
                 assert.are.equal("AXSize", attribute)
                 return options.size_settable ~= false
             end,
+            attributeValue = function(_, attribute)
+                if options.attributes_error then error("AX timeout") end
+                local enabled = ({ AXZoomButton = options.zoom_enabled,
+                    AXGrowArea = options.grow_enabled,
+                    AXFullScreenButton = options.fullscreen_enabled })[attribute]
+                if enabled == nil then return nil end
+                return { attributeValue = function(_, name)
+                    assert.are.equal("AXEnabled", name)
+                    return enabled
+                end }
+            end,
         }
         return window
     end
@@ -204,6 +215,7 @@ describe("PaperWM.windows", function()
         State.is_floating = {}
         State.x_positions = {}
         mock_paperwm.animation_backend = "none"
+        mock_paperwm.resize_control_filter = true
         native_bounds = {}
         native_transforms = {}
         native_capabilities = {
@@ -333,6 +345,103 @@ describe("PaperWM.windows", function()
             assert.are.equal(1, space)
             assert.is_nil(reason)
             assert.is_not_nil(State.index_table[101])
+        end)
+
+        it("rejects Logi-style disabled zoom without grow/fullscreen controls", function()
+            local win = mock_window(101, "Logi Options+", nil, { zoom_enabled = false })
+            local space, reason = Windows.addWindow(win)
+            assert.is_nil(space)
+            assert.are.equal("not resizable", reason)
+            assert.is_nil(State.index_table[101])
+        end)
+
+        for _, control in ipairs({ "grow_enabled", "fullscreen_enabled" }) do
+            it("does not reject disabled zoom with an enabled " .. control, function()
+                local options = { zoom_enabled = false, [control] = true }
+                assert.is_true(Windows.isResizable(mock_window(101, "Resizable", nil, options)))
+            end)
+        end
+
+        it("rejects an explicitly disabled grow area", function()
+            assert.is_false(Windows.isResizable(mock_window(101, "Fixed", nil,
+                { grow_enabled = false, zoom_enabled = true })))
+        end)
+
+        it("fails open when resize controls are missing or unavailable", function()
+            assert.is_true(Windows.isResizable(mock_window(101, "Custom UI")))
+            assert.is_true(Windows.isResizable(mock_window(102, "AX timeout", nil,
+                { attributes_error = true })))
+        end)
+
+        it("can disable the resize-control heuristic without ignoring AXSize", function()
+            mock_paperwm.resize_control_filter = false
+            assert.is_true(Windows.isResizable(mock_window(101, "Custom UI", nil,
+                { zoom_enabled = false })))
+            assert.is_false(Windows.isResizable(mock_window(102, "Fixed", nil,
+                { size_settable = false })))
+        end)
+    end)
+
+    describe("learned resize refusal", function()
+        local clock, saved_clock, win, before, smaller, larger
+        before_each(function()
+            clock, saved_clock = 0, hs.timer.secondsSinceEpoch
+            hs.timer.secondsSinceEpoch = function() return clock end
+            win = mock_window(501, "Fixed custom UI")
+            before = { w = 800, h = 600 }
+            smaller, larger = { w = 700, h = 500 }, { w = 900, h = 700 }
+        end)
+        after_each(function() hs.timer.secondsSinceEpoch = saved_clock end)
+
+        it("blacklists only this window after stable bidirectional refusal", function()
+            assert.is_false(Windows.noteResizeResult(win, before, smaller, before))
+            clock = 1
+            assert.is_false(Windows.noteResizeResult(win, before, larger, before))
+            clock = 2
+            assert.is_true(Windows.noteResizeResult(win, before, larger, before))
+            assert.is_false(Windows.isResizable(win))
+            assert.is_true(Windows.isResizable(mock_window(502, "Same app")))
+            Windows.clearResizeBlacklist(win)
+            assert.is_true(Windows.isResizable(win))
+        end)
+
+        it("does not blacklist a minimum-size or maximum-size clamp", function()
+            for _, target in ipairs({ smaller, larger }) do
+                Windows.clearResizeBlacklist()
+                for i = 1, 5 do
+                    clock = i * 2
+                    assert.is_false(Windows.noteResizeResult(win, before, target, before))
+                end
+                assert.is_true(Windows.isResizable(win))
+            end
+        end)
+
+        it("does not blacklist delayed readbacks or failed reads", function()
+            for i = 1, 8 do
+                clock = i / 10
+                assert.is_false(Windows.noteResizeResult(win, before,
+                    i % 2 == 0 and smaller or larger, before))
+            end
+            clock = 3
+            assert.is_false(Windows.noteResizeResult(win, before, larger, nil))
+            assert.is_false(Windows.noteResizeResult(win, before, larger, larger))
+            assert.is_true(Windows.isResizable(win))
+        end)
+
+        it("resets evidence when either dimension changes or clamps", function()
+            Windows.noteResizeResult(win, before, smaller, before)
+            clock = 3
+            Windows.noteResizeResult(win, before, larger, { w = 850, h = 600 })
+            assert.is_false(Windows.noteResizeResult(win, before, larger, before))
+            assert.is_true(Windows.isResizable(win))
+        end)
+
+        it("does not inherit evidence after a manual resize or reused window ID", function()
+            Windows.noteResizeResult(win, before, smaller, before)
+            clock = 3
+            local changed = { w = 810, h = 610 }
+            assert.is_false(Windows.noteResizeResult(win, changed, larger, changed))
+            assert.is_true(Windows.isResizable(mock_window(501, "New window")))
         end)
     end)
 

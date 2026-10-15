@@ -13,6 +13,7 @@ local Screen <const>      = hs.screen
 local Spaces <const>      = hs.spaces
 local Timer <const>       = hs.timer
 local Window <const>      = hs.window
+local spaceNumbersKey <const> = "WarpMouse.spaceNumbers"
 
 -- Metadata
 MissionControl.name       = "MissionControl"
@@ -200,28 +201,72 @@ function MissionControl:getSpaceIndex(space_id)
     local index = 0
     for _, screen in ipairs(Screen.allScreens()) do
         local screen_uuid = screen:getUUID()
-        for i, space in ipairs(layout[screen_uuid]) do
+        for i, space in ipairs(layout[screen_uuid] or {}) do
             if space == space_id then
                 return index + i
             end
         end
-        index = index + #layout[screen_uuid]
+        index = index + #(layout[screen_uuid] or {})
     end
 
     return nil
 end
 
----get the Mission Control space for the provided index
----@param index number index for Mission Control space
----@return Space|nil
-function MissionControl:getSpaceID(index)
+---resolve shortcut numbers independently of Mission Control thumbnail indexes
+---Assignments are persisted by display UUID and ordinary-desktop ordinal, not
+---transient Space IDs. Fullscreen Spaces never shift those saved ordinals.
+function MissionControl:getShortcutSpaceIDs()
     local layout = Spaces.allSpaces()
-    for _, screen in ipairs(Screen.allScreens()) do
-        local screen_uuid = screen:getUUID()
-        local num_spaces = #layout[screen_uuid]
-        if num_spaces >= index then return layout[screen_uuid][index] end
-        index = index - num_spaces
+    local saved = hs.settings and hs.settings.get(spaceNumbersKey) or {}
+    if type(saved) ~= "table" then saved = {} end
+    local reserved, result, entries = {}, {}, {}
+    local function validNumber(value)
+        local number = tonumber(value)
+        if number and number >= 1 and number <= 9 and number % 1 == 0 then return number end
     end
+    for _, numbers in pairs(saved) do
+        if type(numbers) == "table" then
+            for _, value in pairs(numbers) do
+                local number = validNumber(value)
+                if number then reserved[number] = true end
+            end
+        end
+    end
+    for _, screen in ipairs(Screen.allScreens()) do
+        local uuid, ordinal = screen:getUUID(), 0
+        local numbers = type(saved[uuid]) == "table" and saved[uuid] or {}
+        for _, id in ipairs(layout[uuid] or {}) do
+            local number
+            if not Spaces.spaceType or Spaces.spaceType(id) == "user" then
+                ordinal = ordinal + 1
+                number = validNumber(numbers[tostring(ordinal)] or numbers[ordinal])
+            end
+            local entry = { id = id }
+            entries[#entries + 1] = entry
+            if number and not result[number] then
+                result[number], entry.assigned = id, true
+            end
+        end
+    end
+    -- Keep the old numbering wherever possible. Fill collisions with the next
+    -- free number, without stealing a disconnected display's explicit number.
+    local next_free = 1
+    for default_number, entry in ipairs(entries) do
+        if not entry.assigned then
+            local number = default_number
+            if result[number] or reserved[number] then
+                while result[next_free] or reserved[next_free] do next_free = next_free + 1 end
+                number = next_free
+            end
+            result[number] = entry.id
+        end
+    end
+    return result
+end
+
+---get a Space by its configured PaperWM shortcut number
+function MissionControl:getSpaceID(index)
+    return self:getShortcutSpaceIDs()[index]
 end
 
 ---move the currently focused window to a space for the space ID

@@ -252,25 +252,18 @@ function Space.incrementSpace(direction)
         return
     end
     local curr_space_id = Spaces.focusedSpace()
-    local layout = Spaces.allSpaces()
-    local curr_space_idx = -1
-    local num_spaces = 0
-    for _, screen in ipairs(Screen.allScreens()) do
-        local screen_uuid = screen:getUUID()
-        if curr_space_idx < 0 then
-            for idx, space_id in ipairs(layout[screen_uuid]) do
-                if curr_space_id == space_id then
-                    curr_space_idx = idx + num_spaces
-                    break
-                end
-            end
-        end
-        num_spaces = num_spaces + #layout[screen_uuid]
+    local numbered = Space.MissionControl:getShortcutSpaceIDs()
+    local numbers = {}
+    for number in pairs(numbered) do numbers[#numbers + 1] = number end
+    table.sort(numbers)
+    local curr_space_idx
+    for idx, number in ipairs(numbers) do
+        if numbered[number] == curr_space_id then curr_space_idx = idx; break end
     end
 
-    if curr_space_idx >= 0 then
-        local new_space_idx = ((curr_space_idx - 1 + direction) % num_spaces) + 1
-        Space.switchToSpace(new_space_idx)
+    if curr_space_idx then
+        local new_space_idx = ((curr_space_idx - 1 + direction) % #numbers) + 1
+        Space.switchToSpace(numbers[new_space_idx])
     end
 end
 

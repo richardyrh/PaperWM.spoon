@@ -31,6 +31,79 @@ local watcher_restart_padding <const> = 0.02
 local default_animation_curve <const> = { 0.2, 0.0, 0.0, 1.0 }
 local cached_curve = {}
 local cached_curve_coefficients = nil
+-- Window-local evidence only: never persist a failure against an entire app.
+local resize_observations = {}
+local resize_blacklist = {}
+
+local function axAttribute(element, name)
+    if not element or type(element.attributeValue) ~= "function" then return nil end
+    local ok, value = pcall(element.attributeValue, element, name)
+    if ok then return value end
+end
+
+local function resizeControlReason(element)
+    local grow = axAttribute(element, "AXGrowArea")
+    local grow_enabled = axAttribute(grow, "AXEnabled")
+    if grow_enabled == true then return nil end
+    if grow_enabled == false then return "resize grow area is disabled" end
+    -- Zoomability is not identical to resizability. Only use the disabled
+    -- zoom heuristic when there is no enabled grow/fullscreen control.
+    local zoom = axAttribute(element, "AXZoomButton")
+    if axAttribute(zoom, "AXEnabled") == false and
+        axAttribute(axAttribute(element, "AXFullScreenButton"), "AXEnabled") ~= true then
+        return "zoom is disabled and no enabled resize/fullscreen control exists"
+    end
+end
+
+---clear learned resize failures (one window, or all windows)
+function Windows.clearResizeBlacklist(window)
+    if window then
+        resize_observations[window:id()] = nil
+        resize_blacklist[window:id()] = nil
+    else
+        resize_observations, resize_blacklist = {}, {}
+    end
+end
+
+---observe an existing successful AX write/readback, without issuing test resizes
+---Returns true only after repeated, stable refusals in both directions/axes.
+function Windows.noteResizeResult(window, before, target, accepted)
+    if not accepted or accepted.w <= 0 or accepted.h <= 0 then return false end
+    local id = window:id()
+    local observation = resize_observations[id]
+    if not observation or observation.window ~= window or
+        math.abs(observation.w - before.w) > 1 or math.abs(observation.h - before.h) > 1 then
+        observation = { window = window, since = Timer.secondsSinceEpoch(),
+            w = before.w, h = before.h, attempts = 0, directions = {} }
+        resize_observations[id] = observation
+    end
+    if math.abs(accepted.w - before.w) > 1 or math.abs(accepted.h - before.h) > 1 then
+        -- Changed/clamped sizes prove resizing works; do not mistake a minimum
+        -- size, terminal cell rounding, or a one-axis constraint for fixed size.
+        resize_observations[id] = nil
+        resize_blacklist[id] = nil
+        return false
+    end
+    local meaningful = false
+    for _, axis in ipairs({ "w", "h" }) do
+        local delta = target[axis] - before[axis]
+        if math.abs(delta) >= 8 then
+            meaningful = true
+            observation.directions[axis .. (delta > 0 and "+" or "-")] = true
+        end
+    end
+    if not meaningful then return false end
+    if observation.attempts == 0 then observation.since = Timer.secondsSinceEpoch() end
+    observation.attempts = observation.attempts + 1
+    local directions = observation.directions
+    if observation.attempts >= 3 and Timer.secondsSinceEpoch() - observation.since >= 2 and
+        directions["w+"] and directions["w-"] and directions["h+"] and directions["h-"] then
+        resize_blacklist[id] = { window = window,
+            reason = "repeatedly refused larger and smaller sizes on both axes" }
+        return true
+    end
+    return false
+end
 
 local function animationInterval()
     local fps = tonumber(Windows.PaperWM and Windows.PaperWM.animation_fps) or
@@ -761,6 +834,25 @@ local function abandonNativeRecord(record, reason)
         tostring(reason or "Accessibility size did not converge"))
 end
 
+local function excludeFailedResize(record)
+    local id = record.id
+    quarantined_windows[id] = nil
+    native_animations[id] = nil
+    parked_presentations[id] = nil
+    parked_visual_presentations[id] = nil
+    if record.real_frame then nativeSet(identityTransforms({ record })) end
+    Windows.PaperWM.logger.wf("leaving window %d unmanaged: %s", id,
+        resize_blacklist[id].reason)
+    -- A refusal may be discovered inside tileColumn. Defer list mutation as
+    -- well as reflow so the current layout/animation loop cannot skip siblings.
+    Timer.doAfter(0, function()
+        local rejected = resize_blacklist[id]
+        if not rejected or rejected.window ~= record.window then return end
+        local space = Windows.removeWindow(record.window, true)
+        if space then Windows.PaperWM:tileSpace(space) end
+    end)
+end
+
 local function commitNativeRecord(record)
     local real_frame, bounds_error = nativeBounds(record.id)
     if not real_frame then
@@ -820,6 +912,14 @@ local function commitNativeRecord(record)
                     getWindowSizeImmediately(record.window)
                 accepted_size = retryStickyFrameResize(record.window,
                     record.id, real_frame, record.end_frame, accepted_size)
+                if Windows.noteResizeResult(record.window, real_frame,
+                        record.end_frame, accepted_size) then
+                    nativeSet(identityTransforms({ record }))
+                    if restore_ax_animation then restore_ax_animation() end
+                    if updates_disabled then nativeCall("endUpdates") end
+                    excludeFailedResize({ id = record.id, window = record.window })
+                    return false
+                end
             end
             record.resize_requested = true
             record.resize_attempts = (record.resize_attempts or 0) + 1
@@ -1578,6 +1678,7 @@ local function precommitNativeResize(window, id, real_frame, end_frame)
             if prepared then
                 local accepted = hs.geometry.rect(end_frame.x, end_frame.y,
                     result.accepted_w, result.accepted_h)
+                Windows.noteResizeResult(window, real_frame, end_frame, accepted)
                 local width_pending, height_pending = unchangedResizeDimensions(
                     real_frame, accepted, end_frame)
                 local accepted_end = hs.geometry.rect(end_frame.x, end_frame.y,
@@ -1654,6 +1755,7 @@ local function precommitNativeResize(window, id, real_frame, end_frame)
     local resized_frame = hs.geometry.rect(
         end_frame.x, end_frame.y,
         accepted_size.w, accepted_size.h)
+    Windows.noteResizeResult(window, real_frame, end_frame, accepted_size)
     local width_pending, height_pending = unchangedResizeDimensions(
         real_frame, accepted_size, end_frame)
     local size_pending = width_pending or height_pending
@@ -1738,6 +1840,10 @@ local function animateNativeFrame(window, real_frame, end_frame, watcher, genera
     if not direct and not previous and not quarantined and not parked then
         precommitted, precommit_error = precommitNativeResize(
             window, id, real_frame, end_frame)
+    end
+    if resize_blacklist[id] and resize_blacklist[id].window == window then
+        excludeFailedResize({ id = id, window = window, real_frame = real_frame })
+        return
     end
     if precommitted then
         real_frame = precommitted.real_frame
@@ -2042,6 +2148,7 @@ Windows.Direction = Direction
 ---@param paperwm PaperWM
 function Windows.init(paperwm)
     Windows.PaperWM = paperwm
+    Windows.clearResizeBlacklist()
     native_transform_error = nil
     native_move_error = nil
     resetNativeBackendSelection()
@@ -2690,6 +2797,8 @@ end
 ---@return boolean
 ---@return string|nil
 function Windows.isResizable(window)
+    local rejected = resize_blacklist[window:id()]
+    if rejected and rejected.window == window then return false, rejected.reason end
     local AX = hs.axuielement
     if not AX or type(AX.windowElement) ~= "function" then return true, nil end
 
@@ -2705,6 +2814,10 @@ function Windows.isResizable(window)
     -- when macOS explicitly says its size is not writable.
     if queried and settable == false then
         return false, "AXSize is not settable"
+    end
+    if Windows.PaperWM.resize_control_filter ~= false then
+        local reason = resizeControlReason(element)
+        if reason then return false, reason end
     end
     return true, nil
 end
@@ -3627,6 +3740,8 @@ end
 ---@param frame Frame coordinates to set window size and location
 function Windows.moveWindow(window, frame)
     local id = window:id()
+    local rejected = resize_blacklist[id]
+    if rejected and rejected.window == window then return end
     local watcher = Windows.PaperWM.state.ui_watchers[id]
     if not watcher then
         Windows.PaperWM.logger.e("window does not have ui watcher")
@@ -3718,6 +3833,16 @@ function Windows.moveWindow(window, frame)
             live_reflow_ax_dirty[id] = nil
         else
             window:setFrame(frame)
+        end
+        if not sizesMatch(current_frame, frame) then
+            Timer.doAfter(Window.animationDuration + 0.1, function()
+                if move_generations[id] ~= generation or
+                    Windows.PaperWM.state.ui_watchers[id] ~= watcher then return end
+                local accepted = getWindowSizeImmediately(window)
+                if Windows.noteResizeResult(window, current_frame, frame, accepted) then
+                    excludeFailedResize({ id = id, window = window })
+                end
+            end)
         end
         restartWatcherAfter(Window.animationDuration + watcher_restart_padding,
             id, watcher, generation)
@@ -3879,6 +4004,40 @@ function Windows.stopAnimations(clear_quarantine)
         clearQuarantinedWindows()
         clearParkedPresentations()
     end
+end
+
+---raise visible unmanaged windows in the focused Space and focus the frontmost
+---@return integer raised number of windows raised
+function Windows.raiseUnmanagedWindows()
+    local space = Spaces.focusedSpace()
+    if not space then return 0 end
+
+    local windows = Window.orderedWindows()
+    local raised = 0
+    -- orderedWindows is front-to-back; raise in reverse to retain that order.
+    for i = #windows, 1, -1 do
+        local ok, result = pcall(function()
+            local window = windows[i]
+            local id = window:id()
+            if not id or Windows.PaperWM.state.index_table[id] or
+                window:role() ~= "AXWindow" then return false end
+            for _, window_space in ipairs(Spaces.windowSpaces(window) or {}) do
+                if window_space == space then
+                    -- AXRaise alone can leave background apps behind the active
+                    -- app (notably Finder). focus() activates the owner and raises
+                    -- this window, including Hammerspoon's Finder workaround.
+                    return window:focus() ~= nil
+                end
+            end
+            return false
+        end)
+        if ok and result then
+            raised = raised + 1
+        elseif not ok then
+            Windows.PaperWM.logger.df("could not raise unmanaged window: %s", result)
+        end
+    end
+    return raised
 end
 
 ---add or remove focused window from the floating layer and retile the space

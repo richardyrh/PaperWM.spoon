@@ -9,6 +9,7 @@ Config.default_hotkeys = {
     refresh_windows      = { { "alt", "cmd", "shift" }, "r" },
     dump_state           = { { "alt", "cmd", "shift" }, "d" },
     toggle_floating      = { { "alt", "cmd", "shift" }, "escape" },
+    raise_unmanaged      = { { "ctrl", "shift" }, "u" },
     focus_left           = { { "alt", "cmd" }, "left" },
     focus_right          = { { "alt", "cmd" }, "right" },
     focus_up             = { { "alt", "cmd" }, "up" },
@@ -57,6 +58,10 @@ Config.window_filter = WindowFilter.new():setOverrideFilter({
     hasTitlebar = true,
     allowRoles = "AXStandardWindow",
 })
+
+---reject explicitly disabled resize controls before tiling (a conservative AX heuristic)
+---disable for apps that intentionally disable zoom despite allowing manual resizing
+Config.resize_control_filter = true ---@type boolean
 
 ---window gaps: can be set as a single number or a table with top, bottom, left, right values
 Config.window_gap = 8 ---@type number|{ top: number, bottom: number, left: number, right: number }

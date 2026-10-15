@@ -575,6 +575,9 @@ function Events.windowEventHandler(window, event, self)
     -- Avoid synchronously asking the owning application for its title in the
     -- hot event path; a hung app can otherwise delay every window event.
     self.logger.df("%s for window id: %d", event, window:id())
+    if event == "windowDestroyed" then
+        self.windows.clearResizeBlacklist(window)
+    end
     if event == "windowFocused" then
         if native_drag_probe and native_drag_probe.from_mouse and not drag_owner then
             -- Do not let the focus animation turn a click candidate into a
